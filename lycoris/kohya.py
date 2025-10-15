@@ -401,6 +401,7 @@ class LycorisNetworkKohya(LycorisNetwork):
         # vvvvvvvvvvvvvvvv ADD THIS PART AT THE TOP vvvvvvvvvvvvvvvvv
         from collections import defaultdict
         self.creation_summary = defaultdict(int)
+        self.audit_log = []
         # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
         self.ggpo_beta = kwargs.get("ggpo_beta", None)
@@ -587,7 +588,15 @@ class LycorisNetworkKohya(LycorisNetwork):
             target_replace_modules,
             target_replace_names=[],
         ) -> List:
-            logger.info("Create LyCORIS Module")
+            # <<< CHANGE START: CONTEXTUAL LOGGING >>>
+            component_name = "Unknown Component"
+            if self.LORA_PREFIX_UNET in prefix:
+                component_name = "U-Net"
+            elif self.LORA_PREFIX_TEXT_ENCODER in prefix:
+                component_name = f"Text Encoder ('{prefix.replace(self.LORA_PREFIX_TEXT_ENCODER, 'te')}')"
+            logger.info(f"Creating LyCORIS modules for {component_name}...")
+            # <<< CHANGE END >>>
+            
             loras = []
             next_config = {}
             for name, module in root_module.named_modules():
@@ -600,11 +609,9 @@ class LycorisNetworkKohya(LycorisNetwork):
                         algo = next_config.get("algo", network_module)
                     else:
                         algo = network_module
-                    loras.extend(
-                        create_modules_(f"{prefix}_{name}", module, algo, next_config)[
-                            0
-                        ]
-                    )
+                    created_loras = create_modules_(f"{prefix}_{name}", module, algo, next_config)[0]
+                    loras.extend(created_loras)
+                    # Future improvement: Add audit logging for class-based targets here
                     next_config = {}
                 elif name in target_replace_names or any(
                     self.match_fn(t, name) for t in target_replace_names
@@ -623,78 +630,72 @@ class LycorisNetworkKohya(LycorisNetwork):
                     lora = create_single_module(lora_name, module, algo, **next_config)
                     next_config = {}
                     if lora is not None:
+                        # Logging Hook
+                        matched_pattern = 'default'
+                        for pattern in self.NAME_ALGO_MAP:
+                            if self.match_fn(pattern, name):
+                                matched_pattern = pattern
+                                break
+                        self.audit_log.append({
+                            "lora_name": lora.lora_name,
+                            "algo": lora.__class__.__name__,
+                            "pattern": matched_pattern
+                        })
                         loras.append(lora)
             return loras
 
         if network_module == GLoRAModule:
             logger.info("GLoRA enabled, only train transformer")
-            # only train transformer (for GLoRA)
-            LycorisNetworkKohya.UNET_TARGET_REPLACE_MODULE = [
-                "Transformer2DModel",
-                "Attention",
-            ]
+            LycorisNetworkKohya.UNET_TARGET_REPLACE_MODULE = ["Transformer2DModel", "Attention"]
             LycorisNetworkKohya.UNET_TARGET_REPLACE_NAME = []
 
         self.text_encoder_loras = []
         if text_encoder:
-            if isinstance(text_encoder, list):
-                text_encoders = text_encoder
-                use_index = True
-            else:
-                text_encoders = [text_encoder]
-                use_index = False
-
+            text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+            use_index = len(text_encoders) > 1
             for i, te in enumerate(text_encoders):
-                self.text_encoder_loras.extend(
-                    create_modules(
-                        LycorisNetworkKohya.LORA_PREFIX_TEXT_ENCODER
-                        + (f"{i+1}" if use_index else ""),
-                        te,
-                        LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_MODULE,
-                        LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_NAME,
-                    )
+                prefix = self.LORA_PREFIX_TEXT_ENCODER + (f"{i+1}" if use_index else "")
+                loras = create_modules(
+                    prefix, te, self.TEXT_ENCODER_TARGET_REPLACE_MODULE, self.TEXT_ENCODER_TARGET_REPLACE_NAME
                 )
-            logger.info(
-                f"create LyCORIS for Text Encoder: {len(self.text_encoder_loras)} modules."
-            )
+                self.text_encoder_loras.extend(loras)
+                logger.info(f"Created {len(loras)} LyCORIS modules for {prefix.replace(self.LORA_PREFIX_TEXT_ENCODER, 'te')}")
 
         self.unet_loras = create_modules(
-            LycorisNetworkKohya.LORA_PREFIX_UNET,
-            unet,
-            LycorisNetworkKohya.UNET_TARGET_REPLACE_MODULE,
-            LycorisNetworkKohya.UNET_TARGET_REPLACE_NAME,
+            self.LORA_PREFIX_UNET, unet, self.UNET_TARGET_REPLACE_MODULE, self.UNET_TARGET_REPLACE_NAME
         )
-        logger.info(f"create LyCORIS for U-Net: {len(self.unet_loras)} modules.")
+        logger.info(f"Created {len(self.unet_loras)} LyCORIS modules for U-Net")
 
+        self.weights_sd = None
+        self.loras = self.text_encoder_loras + self.unet_loras
+        
+        names = set()
+        for lora in self.loras:
+            assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
+            names.add(lora.lora_name)
+
+        # <<< CHANGE START: REORDERED AND CONSOLIDATED LOGGING >>>
+        logger.info("--- LyCORIS Module Creation Final Report ---")
+        sorted_audit = sorted(self.audit_log, key=lambda x: x['lora_name'])
+        
+        if not sorted_audit:
+            logger.info("No LyCORIS modules were created.")
+        else:
+            for entry in sorted_audit:
+                logger.info(
+                    f"- Module: {entry['lora_name']:<80} | "
+                    f"Algo: {entry['algo']:<12} | "
+                    f"Preset Pattern: '{entry['pattern']}'"
+                )
+        logger.info("------------------------------------------")
+        
         algo_table = {}
-        for lora in self.text_encoder_loras + self.unet_loras:
+        for lora in self.loras:
             algo_table[lora.__class__.__name__] = (
                 algo_table.get(lora.__class__.__name__, 0) + 1
             )
-        logger.info(f"module type table: {algo_table}")
-
-        self.weights_sd = None
-
-        self.loras = self.text_encoder_loras + self.unet_loras
-        # assertion
-        names = set()
-        for lora in self.loras:
-            assert (
-                lora.lora_name not in names
-            ), f"duplicated lora name: {lora.lora_name}"
-            names.add(lora.lora_name)
-
-        # vvvvvvvvvvvvvvvvv ADD THIS PART AT THE END vvvvvvvvvvvvvvvvvv
-        logger.info("--- Module Creation Summary ---")
-        if not self.creation_summary:
-            logger.info("No modules were created with custom parameters.")
-        else:
-            # Sort for consistent output
-            sorted_summary = sorted(self.creation_summary.items())
-            for (algo, params), count in sorted_summary:
-                logger.info(f"  - Algo: {algo:<10} | Params: {params if params else 'Defaults':<40} | Count: {count}")
-        logger.info("-----------------------------")
-        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        logger.info(f"Module Type Summary: {algo_table}")
+        # <<< CHANGE END >>>
 
     def match_fn(self, pattern: str, name: str) -> bool:
         if self.USE_FNMATCH:
@@ -906,6 +907,7 @@ class LycorisNetworkKohya(LycorisNetwork):
         # --- Construct Final Parameter Groups ---
         all_param_groups = []
         all_lr_descriptions = []
+        all_trainable_weights = 0
         for (comp_type, comp_idx, is_ortho_group, is_lora_plus), params in grouped_params.items():
 
             # Determine Learning Rate for this group
@@ -943,19 +945,25 @@ class LycorisNetworkKohya(LycorisNetwork):
             group_dict['name'] = group_name
             all_param_groups.append(group_dict)
             all_lr_descriptions.append(lr_description)
+            all_trainable_weights += sum(p.numel() for p in params)
 
-        logger.info(f"Training the following {len(all_param_groups)} parameter groups:")
+        logger.info(f"Training the following {len(all_param_groups)} component(s):")
         # Sort groups for consistent print order (optional)
         all_param_groups.sort(key=lambda g: g.get('name', ''))
         for i, group in enumerate(all_param_groups):
+             num_layers = len(group['params'])
+             num_weights = sum(p.numel() for p in group['params'])
              logger.info(f"  Group {i} ('{group.get('name', 'Unnamed')}'): "
                    f"is_ortho_group={group.get('is_ortho_group', 'N/A')}, "
                    f"is_lora_plus_group={group.get('is_lora_plus_group', 'N/A')}, "
                    f"lr={group.get('lr', 'Default')}, "
-                   f"NumParams={len(group['params'])}")
+                   f"NumLayers={num_layers}, NumWeights={num_weights:,}")
+
+        logger.info(f"  All Trained Layers: {sum(len(g['params']) for g in all_param_groups)}")
+        logger.info(f"  All Trained Weights: {all_trainable_weights:,}")
 
         if not all_param_groups:
-             raise Exception("No parameter groups were created. Check model parameters and targets.")
+             raise Exception("No component was found. Check your model format and preset targets.")
 
         return all_param_groups, all_lr_descriptions
 
