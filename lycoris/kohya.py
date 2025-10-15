@@ -2,6 +2,7 @@ import os
 import fnmatch
 import re
 import logging
+import inspect
 
 from typing import Any, List, Optional, Dict, Tuple
 import numbers
@@ -309,7 +310,6 @@ class LycorisNetworkKohya(LycorisNetwork):
         "HunyuanVideoSingleTransformerBlock", # FramePack
         "JointTransformerBlock", # lumina-image-2
         "FinalLayer", # lumina-image-2
-        "QwenImageTransformerBlock", # Qwen
     ]
     UNET_TARGET_REPLACE_NAME = [
         "conv_in",
@@ -335,26 +335,41 @@ class LycorisNetworkKohya(LycorisNetwork):
     NAME_ALGO_MAP = {}
     USE_FNMATCH = False
 
-    @classmethod
-    def apply_preset(cls, preset):
+
+    @classmethod  
+    def apply_preset(cls, preset):  
+        logger.info(f"Applying preset with keys: {preset.keys()}")
+
         if "enable_conv" in preset:
             cls.ENABLE_CONV = preset["enable_conv"]
+            logger.info(f"Set ENABLE_CONV = {cls.ENABLE_CONV}")
+
         if "unet_target_module" in preset:
             cls.UNET_TARGET_REPLACE_MODULE = preset["unet_target_module"]
+            logger.info(f"Set UNET_TARGET_REPLACE_MODULE = {cls.UNET_TARGET_REPLACE_MODULE}")
+
         if "unet_target_name" in preset:
             cls.UNET_TARGET_REPLACE_NAME = preset["unet_target_name"]
+            logger.info(f"Set UNET_TARGET_REPLACE_NAME = {cls.UNET_TARGET_REPLACE_NAME}")
+
         if "text_encoder_target_module" in preset:
-            cls.TEXT_ENCODER_TARGET_REPLACE_MODULE = preset[
-                "text_encoder_target_module"
-            ]
+            cls.TEXT_ENCODER_TARGET_REPLACE_MODULE = preset["text_encoder_target_module"]
+            logger.info(f"Set TEXT_ENCODER_TARGET_REPLACE_MODULE = {cls.TEXT_ENCODER_TARGET_REPLACE_MODULE}")
+
         if "text_encoder_target_name" in preset:
             cls.TEXT_ENCODER_TARGET_REPLACE_NAME = preset["text_encoder_target_name"]
-        if "module_algo_map" in preset:
-            cls.MODULE_ALGO_MAP = preset["module_algo_map"]
+            logger.info(f"Set TEXT_ENCODER_TARGET_REPLACE_NAME = {cls.TEXT_ENCODER_TARGET_REPLACE_NAME}")
+        
+        # vvvvvvvvvv THIS IS THE PART YOU NEED TO ADD vvvvvvvvvvvv
         if "name_algo_map" in preset:
             cls.NAME_ALGO_MAP = preset["name_algo_map"]
+            logger.info(f"Set NAME_ALGO_MAP = {cls.NAME_ALGO_MAP}")
+        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
         if "use_fnmatch" in preset:
             cls.USE_FNMATCH = preset["use_fnmatch"]
+            logger.info(f"Set USE_FNMATCH = {cls.USE_FNMATCH}")
+
         return cls
 
     def __init__(
@@ -382,6 +397,11 @@ class LycorisNetworkKohya(LycorisNetwork):
         self.lora_dim = lora_dim
         self.train_t5xxl = train_t5xxl
         self._current_step = 0
+
+        # vvvvvvvvvvvvvvvv ADD THIS PART AT THE TOP vvvvvvvvvvvvvvvvv
+        from collections import defaultdict
+        self.creation_summary = defaultdict(int)
+        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
         self.ggpo_beta = kwargs.get("ggpo_beta", None)
         self.ggpo_sigma = kwargs.get("ggpo_sigma", None)
@@ -486,7 +506,32 @@ class LycorisNetworkKohya(LycorisNetwork):
                     return None
             else:
                 return None
-            lora = network_module_dict[algo_name](
+
+            # Get the actual module class from the dictionary
+            module_class = network_module_dict[algo_name]
+            
+            # Use the inspect detective to get the module's default arguments
+            sig = inspect.signature(module_class.__init__)
+            default_params = {
+                p.name: p.default
+                for p in sig.parameters.values()
+                if p.default is not inspect.Parameter.empty
+            }
+            
+            # Find all arguments you provided that are DIFFERENT from the defaults
+            non_default_args = []
+            for key, value in kwargs.items():
+                if key in default_params and value != default_params[key]:
+                    non_default_args.append(f"{key}={value}")
+            
+            # Sort them so the order is always the same for consistent grouping
+            non_default_args.sort()
+            param_str = ", ".join(non_default_args)
+            
+            # Add this unique configuration to our summary
+            self.creation_summary[(algo_name, param_str)] += 1
+
+            lora = module_class(
                 lora_name,
                 module,
                 self.multiplier,
@@ -638,6 +683,18 @@ class LycorisNetworkKohya(LycorisNetwork):
                 lora.lora_name not in names
             ), f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
+
+        # vvvvvvvvvvvvvvvvv ADD THIS PART AT THE END vvvvvvvvvvvvvvvvvv
+        logger.info("--- Module Creation Summary ---")
+        if not self.creation_summary:
+            logger.info("No modules were created with custom parameters.")
+        else:
+            # Sort for consistent output
+            sorted_summary = sorted(self.creation_summary.items())
+            for (algo, params), count in sorted_summary:
+                logger.info(f"  - Algo: {algo:<10} | Params: {params if params else 'Defaults':<40} | Count: {count}")
+        logger.info("-----------------------------")
+        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
     def match_fn(self, pattern: str, name: str) -> bool:
         if self.USE_FNMATCH:

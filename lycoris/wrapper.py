@@ -34,6 +34,7 @@ from .logging import logger
 
 from typing import Optional
 
+LORA_PLUS_TARGETS = ["lora_up","a1","b1"]
 
 VALID_PRESET_KEYS = [
     "enable_conv",
@@ -529,6 +530,7 @@ class LycorisNetwork(torch.nn.Module):
                 elif name in target_replace_names or any(
                     self.match_fn(t, name) for t in target_replace_names
                 ):
+                    logger.info(f"Matched layer by name: {name}")  # Add this  
                     conf_from_name = self.find_conf_for_name(name)
                     if conf_from_name is not None:
                         next_config = conf_from_name
@@ -599,13 +601,22 @@ class LycorisNetwork(torch.nn.Module):
         self,
         name: str,
     ) -> dict[str, Any]:
+        logger.info(f"[DEBUG] Checking name_algo_map for: {name}")
+        logger.info(f"[DEBUG] NAME_ALGO_MAP keys: {list(self.NAME_ALGO_MAP.keys())}")
+        logger.info(f"[DEBUG] USE_FNMATCH: {self.USE_FNMATCH}")
+        
         if name in self.NAME_ALGO_MAP.keys():
+            logger.info(f"[DEBUG] Exact match found: {name}")
             return self.NAME_ALGO_MAP[name]
-
+        
         for key, value in self.NAME_ALGO_MAP.items():
-            if self.match_fn(key, name):
+            matches = self.match_fn(key, name)
+            logger.info(f"[DEBUG] Pattern '{key}' vs '{name}': {matches}")
+            if matches:
+                logger.info(f"[DEBUG] Matched! Returning config: {value}")
                 return value
-
+        
+        logger.info(f"[DEBUG] No match found for: {name}")
         return None
 
     def set_multiplier(self, multiplier):
