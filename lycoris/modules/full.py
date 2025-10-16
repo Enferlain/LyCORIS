@@ -159,7 +159,9 @@ class FullModule(LycorisBaseModule):
             if self.rank_dropout and self.training
             else 1
         )
-        if drop != 1 or scale != 1 or self.is_diff:
+        
+        # Fixed: check if dropout is active without ambiguous boolean
+        if torch.is_tensor(drop) or scale != 1 or self.is_diff:
             diff_w, diff_b = self.get_diff_weight(scale, device=device)
             weight = self.org_weight + diff_w * drop
             if self.org_bias is not None:
@@ -169,6 +171,7 @@ class FullModule(LycorisBaseModule):
         else:
             weight = self.weight
             bias = self.bias
+        
         return weight, bias
 
     def get_diff_weight(self, multiplier=1, shape=None, device=None):
