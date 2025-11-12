@@ -6,6 +6,8 @@ import torch.nn as nn
 from .base import LycorisBaseModule
 from ..functional.loha import diff_weight as loha_diff_weight
 
+from typing import Optional
+
 
 class LohaModule(LycorisBaseModule):
     name = "loha"
@@ -41,9 +43,11 @@ class LohaModule(LycorisBaseModule):
         use_scalar=False,
         rank_dropout_scale=False,
         weight_decompose=False,
-        wd_on_out=True,
+        wd_on_output=True,
         bypass_mode=None,
         rs_lora=False,
+        ggpo_beta: Optional[float] = None,
+        ggpo_sigma: Optional[float] = None,
         **kwargs,
     ):
         super().__init__(
@@ -55,6 +59,8 @@ class LohaModule(LycorisBaseModule):
             module_dropout,
             rank_dropout_scale,
             bypass_mode,
+            ggpo_beta,
+            ggpo_sigma
         )
         if self.module_type not in self.support_module:
             raise ValueError(f"{self.module_type} is not supported in LoHa algo.")
@@ -99,11 +105,11 @@ class LohaModule(LycorisBaseModule):
             self.hada_w2_b = nn.Parameter(torch.empty(lora_dim, w_shape[1]))
 
         self.wd = weight_decompose
-        self.wd_on_out = wd_on_out
+        self.wd_on_output = wd_on_output
         if self.wd:
             org_weight = org_module.weight.cpu().clone().float()
             self.dora_norm_dims = org_weight.dim() - 1
-            if self.wd_on_out:
+            if self.wd_on_output:
                 self.dora_scale = nn.Parameter(
                     torch.norm(
                         org_weight.reshape(org_weight.shape[0], -1),
@@ -243,7 +249,7 @@ class LohaModule(LycorisBaseModule):
 
     def apply_weight_decompose(self, weight, multiplier=1):
         weight = weight.to(self.dora_scale.dtype)
-        if self.wd_on_out:
+        if self.wd_on_output:
             weight_norm = (
                 weight.reshape(weight.shape[0], -1)
                 .norm(dim=1)
@@ -288,8 +294,16 @@ class LohaModule(LycorisBaseModule):
         scaled = norm != desired
         if scaled:
             self.scalar *= ratio
-
-        return scaled, orig_norm * ratio
+            return scaled, orig_norm * ratio
+        else:
+            return 0, orig_norm
+        
+    @torch.no_grad()
+    def get_norm(self, device=None):
+        weight = self.get_weight(self.shape)
+        # Norm before scale determined by self.scalar
+        unscaled_norm = weight.norm()
+        return unscaled_norm
 
     def bypass_forward_diff(self, x, scale=1):
         diff_weight = self.get_weight(self.shape) * self.scalar * scale
@@ -301,22 +315,29 @@ class LohaModule(LycorisBaseModule):
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
-                return self.org_forward(x, *args, **kwargs)
-
+                return self.op(
+                    x,
+                    self.org_module[0].weight.data,
+                    (
+                        None
+                        if self.org_module[0].bias is None
+                        else self.org_module[0].bias.data
+                    ),
+                )
         if self.bypass_mode:
             return self.bypass_forward(x, scale=self.multiplier)
-
-        base = self.org_forward(x, *args, **kwargs)
-        base_weight = self._current_weight().to(x.device)
-        diff_weight = self.get_weight(self.shape).to(base_weight.dtype) * self.scalar
-
-        if self.wd:
-            new_weight = self.apply_weight_decompose(
-                base_weight + diff_weight, self.multiplier
-            )
         else:
-            new_weight = base_weight + diff_weight * self.multiplier
-
-        delta_weight = new_weight - base_weight
-        delta = self.op(x, delta_weight, None, **self.kw_dict)
-        return base + delta
+            diff_weight = self.get_weight(self.shape).to(self.dtype) * self.scalar
+            weight = self.org_module[0].weight.data.to(self.dtype)
+            if self.wd:
+                weight = self.apply_weight_decompose(
+                    weight + diff_weight, self.multiplier
+                )
+            else:
+                weight = weight + diff_weight * self.multiplier
+            bias = (
+                None
+                if self.org_module[0].bias is None
+                else self.org_module[0].bias.data
+            )
+            return self.op(x, weight, bias, **self.kw_dict)

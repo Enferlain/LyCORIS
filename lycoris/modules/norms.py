@@ -4,6 +4,8 @@ import torch.nn as nn
 from .base import LycorisBaseModule
 from ..logging import warning_once
 
+from typing import Optional
+
 
 class NormModule(LycorisBaseModule):
     name = "norm"
@@ -122,40 +124,36 @@ class NormModule(LycorisBaseModule):
             bias = None
         return weight, bias
 
-    def forward(self, x, *args, **kwargs):
+    def forward(self, x):
         if self.not_supported or (
             self.module_dropout
             and self.training
             and torch.rand(1) < self.module_dropout
         ):
-            return self.org_forward(x, *args, **kwargs)
+            return self.org_forward(x)
+        scale = self.multiplier
 
-        base = self.org_forward(x, *args, **kwargs)
-
-        weight, bias = self.make_weight(self.multiplier, x.device)
-        org_weight = self._current_weight().to(weight.device, dtype=weight.dtype)
-        delta_w = weight - org_weight
-
-        delta_b = None
-        if bias is not None:
-            bias = bias.to(x.device)
-            org_bias = self._current_bias()
-            if org_bias is not None:
-                delta_b = bias - org_bias.to(bias.device)
-            else:
-                delta_b = bias
-
+        w, b = self.make_weight(scale, x.device)
         if self.org_norm is not None:
             normed = self.org_norm(x)
-            delta = normed * delta_w
-            if delta_b is not None:
-                delta = delta + delta_b
-            return base + delta
+            scaled = normed * w
+            if b is not None:
+                scaled += b
+            return scaled
 
-        kw_dict = self.kw_dict | {"weight": delta_w, "bias": delta_b}
-        delta = self.op(x, **kw_dict)
-        return base + delta
+        kw_dict = self.kw_dict | {"weight": w, "bias": b}
+        return self.op(x, **kw_dict)
+    
+    @torch.no_grad()
+    def update_norms(self):
+        return
 
+    @torch.no_grad()
+    def update_grad_norms(self):
+        return
+
+    def init_ggpo(self):
+        return
 
 if __name__ == "__main__":
     base = nn.LayerNorm(128).cuda()

@@ -10,6 +10,8 @@ from ..functional import factorization, rebuild_tucker
 from ..functional.lokr import make_kron
 from ..logging import logger
 
+from typing import Optional
+
 
 @cache
 def logging_force_full_matrix(lora_dim, dim, factor):
@@ -58,11 +60,14 @@ class LokrModule(LycorisBaseModule):
         factor: int = -1,  # factorization factor
         rank_dropout_scale=False,
         weight_decompose=False,
-        wd_on_out=True,
+        wd_on_output=True,
         full_matrix=False,
         bypass_mode=None,
         rs_lora=False,
         unbalanced_factorization=False,
+        ggpo_beta: Optional[float] = None,
+        ggpo_sigma: Optional[float] = None,
+        orthogonalize=False,
         **kwargs,
     ):
         super().__init__(
@@ -74,6 +79,8 @@ class LokrModule(LycorisBaseModule):
             module_dropout,
             rank_dropout_scale,
             bypass_mode,
+            ggpo_beta,
+            ggpo_sigma
         )
         if self.module_type not in self.support_module:
             raise ValueError(f"{self.module_type} is not supported in LoKr algo.")
@@ -85,6 +92,9 @@ class LokrModule(LycorisBaseModule):
         self.use_w2 = False
         self.full_matrix = full_matrix
         self.rs_lora = rs_lora
+        self.use_orthogonal_weights = orthogonalize
+        if self.use_orthogonal_weights == True and use_scalar == False:
+            use_scalar = True
 
         if self.module_type.startswith("conv"):
             in_dim = org_module.in_channels
@@ -173,11 +183,11 @@ class LokrModule(LycorisBaseModule):
                 self.lokr_w2 = nn.Parameter(torch.empty(shape[0][1], shape[1][1]))
 
         self.wd = weight_decompose
-        self.wd_on_out = wd_on_out
+        self.wd_on_output = wd_on_output
         if self.wd:
             org_weight = org_module.weight.cpu().clone().float()
             self.dora_norm_dims = org_weight.dim() - 1
-            if self.wd_on_out:
+            if self.wd_on_output:
                 self.dora_scale = nn.Parameter(
                     torch.norm(
                         org_weight.reshape(org_weight.shape[0], -1),
@@ -224,24 +234,43 @@ class LokrModule(LycorisBaseModule):
             self.register_buffer("scalar", torch.tensor(1.0), persistent=False)
 
         if self.use_w2:
-            if use_scalar:
+            if self.use_orthogonal_weights:
+                torch.nn.init.orthogonal_(self.lokr_w2)
+            elif use_scalar:
                 torch.nn.init.kaiming_uniform_(self.lokr_w2, a=math.sqrt(5))
             else:
                 torch.nn.init.constant_(self.lokr_w2, 0)
         else:
             if self.tucker:
-                torch.nn.init.kaiming_uniform_(self.lokr_t2, a=math.sqrt(5))
-            torch.nn.init.kaiming_uniform_(self.lokr_w2_a, a=math.sqrt(5))
-            if use_scalar:
+                if self.use_orthogonal_weights:
+                    torch.nn.init.orthogonal_(self.lokr_t2)
+                else:
+                    torch.nn.init.kaiming_uniform_(self.lokr_t2, a=math.sqrt(5))
+
+            if self.use_orthogonal_weights:
+                torch.nn.init.orthogonal_(self.lokr_w2_a)
+            else:
+                torch.nn.init.kaiming_uniform_(self.lokr_w2_a, a=math.sqrt(5))
+
+            if self.use_orthogonal_weights:
+                torch.nn.init.orthogonal_(self.lokr_w2_b)
+            elif use_scalar:
                 torch.nn.init.kaiming_uniform_(self.lokr_w2_b, a=math.sqrt(5))
             else:
                 torch.nn.init.constant_(self.lokr_w2_b, 0)
 
         if self.use_w1:
-            torch.nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5))
+            if self.use_orthogonal_weights:
+                torch.nn.init.orthogonal_(self.lokr_w1)
+            else:
+                torch.nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5))
         else:
-            torch.nn.init.kaiming_uniform_(self.lokr_w1_a, a=math.sqrt(5))
-            torch.nn.init.kaiming_uniform_(self.lokr_w1_b, a=math.sqrt(5))
+            if self.use_orthogonal_weights:
+                torch.nn.init.orthogonal_(self.lokr_w1_a)
+                torch.nn.init.orthogonal_(self.lokr_w1_b)
+            else:
+                torch.nn.init.kaiming_uniform_(self.lokr_w1_a, a=math.sqrt(5))
+                torch.nn.init.kaiming_uniform_(self.lokr_w1_b, a=math.sqrt(5))
 
     @classmethod
     def make_module_from_state_dict(
@@ -356,24 +385,30 @@ class LokrModule(LycorisBaseModule):
             )
 
     def get_weight(self, shape):
-        weight = make_kron(
-            self.lokr_w1 if self.use_w1 else self.lokr_w1_a @ self.lokr_w1_b,
-            (
-                self.lokr_w2
-                if self.use_w2
-                else (
-                    rebuild_tucker(self.lokr_t2, self.lokr_w2_a, self.lokr_w2_b)
-                    if self.tucker
-                    else self.lokr_w2_a @ self.lokr_w2_b
-                )
-            ),
-            self.scale,
-        )
+        if self.use_w1:
+            w1 = self._orthogonalize(self.lokr_w1)
+        else:
+            w1_a_ortho = self._orthogonalize(self.lokr_w1_a)
+            w1_b_ortho = self._orthogonalize(self.lokr_w1_b)
+            w1 = w1_a_ortho @ w1_b_ortho
+
+        if self.use_w2:
+            w2 = self._orthogonalize(self.lokr_w2)
+        else:
+            w2_a_ortho = self._orthogonalize(self.lokr_w2_a)
+            w2_b_ortho = self._orthogonalize(self.lokr_w2_b)
+            if self.tucker:
+                # We don't orthogonalize the core tensor `lokr_t2`
+                w2 = rebuild_tucker(self.lokr_t2, w2_a_ortho, w2_b_ortho)
+            else:
+                w2 = w2_a_ortho @ w2_b_ortho
+        
+        weight = make_kron(w1, w2, self.scale)
         dtype = weight.dtype
         if shape is not None:
             weight = weight.view(shape)
         if self.training and self.rank_dropout:
-            drop = (torch.rand(weight.size(0)) > self.rank_dropout).to(dtype)
+            drop = (torch.rand(weight.size(0), device=weight.device) > self.rank_dropout).to(dtype)
             drop = drop.view(-1, *[1] * len(weight.shape[1:]))
             if self.rank_dropout_scale:
                 drop /= drop.mean()
@@ -398,7 +433,7 @@ class LokrModule(LycorisBaseModule):
 
     def apply_weight_decompose(self, weight, multiplier=1):
         weight = weight.to(self.dora_scale.dtype)
-        if self.wd_on_out:
+        if self.wd_on_output:
             weight_norm = (
                 weight.reshape(weight.shape[0], -1)
                 .norm(dim=1)
@@ -462,16 +497,23 @@ class LokrModule(LycorisBaseModule):
                     self.lokr_t2 *= ratio ** (1 / modules)
                 self.lokr_w2_a *= ratio ** (1 / modules)
                 self.lokr_w2_b *= ratio ** (1 / modules)
-
-        return scaled, orig_norm * ratio
+            return scaled, orig_norm * ratio
+        else:
+            return 0, orig_norm
+        
+    @torch.no_grad()
+    def get_norm(self, device=None):
+        weight = self.get_weight(self.shape)
+        unscaled_norm = weight.norm()
+        return unscaled_norm
 
     def bypass_forward_diff(self, h, scale=1):
         is_conv = self.module_type.startswith("conv")
         if self.use_w2:
-            ba = self.lokr_w2
+            ba = self._orthogonalize(self.lokr_w2)
         else:
-            a = self.lokr_w2_b
-            b = self.lokr_w2_a
+            a = self._orthogonalize(self.lokr_w2_b)
+            b = self._orthogonalize(self.lokr_w2_a)
 
             if self.tucker:
                 t = self.lokr_t2
@@ -482,9 +524,11 @@ class LokrModule(LycorisBaseModule):
                 b = b.view(*b.shape, *[1] * (len(self.shape) - 2))
 
         if self.use_w1:
-            c = self.lokr_w1
+            c = self._orthogonalize(self.lokr_w1)
         else:
-            c = self.lokr_w1_a @ self.lokr_w1_b
+            w1_a_ortho = self._orthogonalize(self.lokr_w1_a)
+            w1_b_ortho = self._orthogonalize(self.lokr_w1_b)
+            c = w1_a_ortho @ w1_b_ortho
         uq = c.size(1)
 
         if is_conv:
@@ -541,29 +585,31 @@ class LokrModule(LycorisBaseModule):
         return self.org_forward(x) + self.bypass_forward_diff(x, scale=scale)
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
-        if self.module_dropout and self.training:
-            if torch.rand(1) < self.module_dropout:
-                return self.org_forward(x, *args, **kwargs)
+        if self.module_dropout and self.training and torch.rand(1) < self.module_dropout:
+            return self.org_forward(x, *args, **kwargs)
 
+        # Prefer built-in bypass if available (no full ΔW materialization)
         if self.bypass_mode:
             return self.bypass_forward(x, self.multiplier)
 
-        base = self.org_forward(x, *args, **kwargs)
-        base_weight = self._current_weight().to(x.device)
-        diff_weight = self.get_weight(self.shape).to(base_weight.dtype) * self.scalar
+        base_output = self.org_forward(x, *args, **kwargs)
+
+        # Keep ΔW small and on the same device/dtype as activations
+        diff_weight = self.get_weight(self.shape).to(device=x.device, dtype=x.dtype) * self.scalar
 
         if self.wd:
-            new_weight = self.apply_weight_decompose(
-                base_weight + diff_weight, self.multiplier
-            )
-        elif self.multiplier == 1:
-            new_weight = base_weight + diff_weight
+            # Strongly consider disabling this branch with ramtorch
+            org_w = self.org_module[0].weight.to(device=x.device, dtype=x.dtype)
+            merged = org_w + diff_weight * self.multiplier
+            final_w = self.apply_weight_decompose(merged, 1.0)
+            delta_w = final_w - org_w
+            bias = self.org_module[0].bias
+            delta_b = torch.zeros_like(bias, device=x.device, dtype=x.dtype) if bias is not None else None
+            delta_output = self.op(x, delta_w, delta_b, **self.kw_dict)
         else:
-            new_weight = base_weight + diff_weight * self.multiplier
+            delta_output = self.op(x, diff_weight * self.multiplier, **self.kw_dict)
 
-        delta_weight = new_weight - base_weight
-        delta = self.op(x, delta_weight, None, **self.kw_dict)
-        return base + delta
+        return base_output + delta_output
 
 
 if __name__ == "__main__":

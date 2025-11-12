@@ -3,6 +3,8 @@ import torch.nn as nn
 
 from .base import LycorisBaseModule
 
+from typing import Optional
+
 
 class IA3Module(LycorisBaseModule):
     name = "ia3"
@@ -32,6 +34,8 @@ class IA3Module(LycorisBaseModule):
         bypass_mode=None,
         rs_lora=False,
         train_on_input=False,
+        ggpo_beta: Optional[float] = None,
+        ggpo_sigma: Optional[float] = None,
         **kwargs,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
@@ -44,6 +48,8 @@ class IA3Module(LycorisBaseModule):
             module_dropout,
             rank_dropout_scale,
             bypass_mode,
+            ggpo_beta,
+            ggpo_sigma
         )
         if self.module_type not in self.support_module:
             raise ValueError(f"{self.module_type} is not supported in IA^3 algo.")
@@ -129,16 +135,14 @@ class IA3Module(LycorisBaseModule):
     def forward(self, x, *args, **kwargs):
         if self.module_dropout and self.training:
             if torch.rand(1) < self.module_dropout:
-                return self.org_forward(x, *args, **kwargs)
+                return self.org_forward(x)
         if self.bypass_mode:
             return self.bypass_forward(x, self.multiplier)
         else:
-            base = self.org_forward(x, *args, **kwargs)
-            merged_weight = self.get_merged_weight(multiplier=self.multiplier)[0]
-            base_weight = self._current_weight().to(x.device)
-            merged_weight = merged_weight.to(
-                base_weight.device, dtype=base_weight.dtype
+            weight = self.get_merged_weight(multiplier=self.multiplier)[0]
+            bias = (
+                None
+                if self.org_module[0].bias is None
+                else self.org_module[0].bias.data
             )
-            delta_weight = merged_weight - base_weight
-            delta = self.op(x, delta_weight, None, **self.kw_dict)
-            return base + delta
+            return self.op(x, weight, bias, **self.kw_dict)

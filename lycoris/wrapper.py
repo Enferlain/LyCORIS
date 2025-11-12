@@ -6,9 +6,15 @@ import logging
 
 from typing import Any, List
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 
+import math
+
+from .utils import precalculate_safetensors_hashes
+from .modules.abba import AbbaModule
 from .modules.locon import LoConModule
 from .modules.loha import LohaModule
 from .modules.lokr import LokrModule
@@ -21,13 +27,31 @@ from .modules.boft import ButterflyOFTModule
 from .modules import get_module, make_module
 
 from .config import PRESET
-from .config_sdk import VALID_PRESET_KEYS
 from .utils.preset import read_preset
 from .utils import str_bool
 from .logging import logger
 
+from typing import Optional
+
+
+VALID_PRESET_KEYS = [
+    "enable_conv",
+    "target_module",
+    "target_name",
+    "module_algo_map",
+    "name_algo_map",
+    "lora_prefix",
+    "use_fnmatch",
+    "unet_target_module",
+    "unet_target_name",
+    "text_encoder_target_module",
+    "text_encoder_target_name",
+    "exclude_name",
+]
+
 
 network_module_dict = {
+    "abba": AbbaModule,
     "lora": LoConModule,
     "locon": LoConModule,
     "loha": LohaModule,
@@ -77,7 +101,38 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
     wd_on_output = str_bool(kwargs.get("wd_on_output", True))
     full_matrix = str_bool(kwargs.get("full_matrix", False))
     bypass_mode = str_bool(kwargs.get("bypass_mode", False))
+    rs_lora = str_bool(kwargs.get("rs_lora", False))
     unbalanced_factorization = str_bool(kwargs.get("unbalanced_factorization", False))
+    orthogonalize = str_bool(kwargs.get("orthogonalize", False))
+    if orthogonalize:
+        logger.info("Orthogonalization of weights for Lycoris is enabled")
+        if use_scalar == False:
+            logger.info("Forcing usage of use_scalar as orthogonalization is enabled")
+            use_scalar = True
+    torch_compile = str_bool(kwargs.get("torch_compile", False))
+    torch_compile_mode = kwargs.get("torch_compile_mode", "max-autotune")
+    torch_compile_dynamic = str_bool(kwargs.get("torch_compile_dynamic", False))
+    torch_compile_fullgraph = str_bool(kwargs.get("torch_compile_fullgraph", True))
+
+    ggpo_beta = kwargs.get("ggpo_beta", None)
+    ggpo_sigma = kwargs.get("ggpo_sigma", None)
+    ggpo_conv = kwargs.get("ggpo_conv", False)
+    ggpo_conv_weight_sample_size = kwargs.get("ggpo_conv_weight_sample_size", 100)
+
+    if ggpo_beta is not None:
+        ggpo_beta = float(ggpo_beta)
+
+    if ggpo_sigma is not None:
+        ggpo_sigma = float(ggpo_sigma)
+
+    if ggpo_conv is not None:
+        ggpo_conv = bool(ggpo_conv)
+
+    if ggpo_conv_weight_sample_size is not None:
+        ggpo_conv_weight_sample_size = int(ggpo_conv_weight_sample_size)
+
+    if ggpo_beta is not None and ggpo_sigma is not None:
+        logger.info(f"LoRA-GGPO training sigma: {ggpo_sigma} beta: {ggpo_beta}")
 
     if unbalanced_factorization:
         logger.info("Unbalanced factorization for LoKr is enabled")
@@ -87,6 +142,12 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
 
     if weight_decompose:
         logger.info("Weight decomposition is enabled")
+
+    if bypass_mode and weight_decompose:
+        bypass_mode = False
+        logger.info("Because weight decomposition (DoRA) is enabled, bypass mode has been disabled")
+    elif bypass_mode:
+        logger.info("Bypass mode is enabled")
 
     if full_matrix:
         logger.info("Full matrix mode for LoKr is enabled")
@@ -100,6 +161,12 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
     LycorisNetwork.apply_preset(preset)
 
     logger.info(f"Using rank adaptation algo: {algo}")
+
+    if torch_compile:
+        logger.info(f"Torch compile enabled for network.\n \
+                    dynamic={torch_compile_dynamic}\n \
+                    mode={torch_compile_mode}\n \
+                    fullgraph={torch_compile_fullgraph}")
 
     network = LycorisNetwork(
         module,
@@ -121,13 +188,22 @@ def create_lycoris(module, multiplier=1.0, linear_dim=4, linear_alpha=1, **kwarg
         constraint=constraint,
         rescaled=rescaled,
         weight_decompose=weight_decompose,
-        wd_on_out=wd_on_output,
+        wd_on_output=wd_on_output,
         full_matrix=full_matrix,
         bypass_mode=bypass_mode,
+        rs_lora=rs_lora,
         unbalanced_factorization=unbalanced_factorization,
+        ggpo_beta=ggpo_beta,
+        ggpo_sigma=ggpo_sigma,
+        ggpo_conv_weight_sample_size=ggpo_conv_weight_sample_size,
+        orthogonalize=orthogonalize,
     )
 
-    return network
+    if torch_compile:
+        with torch._dynamo.utils.disable_cache_limit():
+            return torch.compile(network, dynamic=torch_compile_dynamic, mode=torch_compile_mode, fullgraph=torch_compile_fullgraph)
+    else:
+        return network
 
 
 def create_lycoris_from_weights(multiplier, file, module, weights_sd=None, **kwargs):
@@ -231,9 +307,9 @@ class LycorisNetwork(torch.nn.Module):
         alpha=1,
         conv_alpha=1,
         use_tucker=False,
-        dropout=0,
-        rank_dropout=0,
-        module_dropout=0,
+        dropout=0.0,
+        rank_dropout=0.0,
+        module_dropout=0.0,
         network_module: str = "locon",
         norm_modules=NormModule,
         train_norm=False,
@@ -243,13 +319,34 @@ class LycorisNetwork(torch.nn.Module):
         super().__init__()
         root_kwargs = kwargs
         self.weights_sd = None
+        self._current_step = 0
+
+        self.ggpo_beta = kwargs.get("ggpo_beta", None)
+        self.ggpo_sigma = kwargs.get("ggpo_sigma", None)
+        self.ggpo_conv = kwargs.get("ggpo_conv", False)
+        self.ggpo_conv_weight_sample_size = kwargs.get("ggpo_conv_weight_sample_size", 100)
+
+        self.wd_on_output = kwargs.get("wd_on_output", True)
+
+        if self.ggpo_beta is not None:
+            self.ggpo_beta = float(self.ggpo_beta)
+
+        if self.ggpo_sigma is not None:
+            self.ggpo_sigma = float(self.ggpo_sigma)
+
+        if self.ggpo_conv is not None:
+            self.ggpo_conv = bool(self.ggpo_conv)
+
+        if self.ggpo_conv_weight_sample_size is not None:
+            self.ggpo_conv_weight_sample_size = int(self.ggpo_conv_weight_sample_size)
+
         if init_only:
             self.multiplier = 1
             self.lora_dim = 0
             self.alpha = 1
             self.conv_lora_dim = 0
             self.conv_alpha = 1
-            self.dropout = 0
+            self.dropout = 0.0
             self.rank_dropout = 0
             self.module_dropout = 0
             self.use_tucker = False
@@ -277,6 +374,10 @@ class LycorisNetwork(torch.nn.Module):
 
         if 1 >= dropout >= 0:
             logger.info(f"Use Dropout value: {dropout}")
+
+        if self.wd_on_output is not None:
+            logger.info(f"wd_on_output={self.wd_on_output}")
+
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
@@ -299,11 +400,11 @@ class LycorisNetwork(torch.nn.Module):
 
             if train_norm and "Norm" in module.__class__.__name__:
                 return norm_modules(
-                    lora_name,
-                    module,
-                    self.multiplier,
-                    self.rank_dropout,
-                    self.module_dropout,
+                    lora_name=lora_name,
+                    org_module=module,
+                    multiplier=self.multiplier,
+                    rank_dropout=self.rank_dropout,
+                    module_dropout=self.module_dropout,
                     **kwargs,
                 )
             lora = None
@@ -334,6 +435,10 @@ class LycorisNetwork(torch.nn.Module):
                 self.rank_dropout,
                 self.module_dropout,
                 use_tucker,
+                self.ggpo_beta,
+                self.ggpo_sigma,
+                self.ggpo_conv,
+                self.ggpo_conv_weight_sample_size,
                 **kwargs,
             )
             return lora
@@ -500,13 +605,22 @@ class LycorisNetwork(torch.nn.Module):
         self,
         name: str,
     ) -> dict[str, Any]:
+        logger.info(f"[DEBUG] Checking name_algo_map for: {name}")
+        logger.info(f"[DEBUG] NAME_ALGO_MAP keys: {list(self.NAME_ALGO_MAP.keys())}")
+        logger.info(f"[DEBUG] USE_FNMATCH: {self.USE_FNMATCH}")
+        
         if name in self.NAME_ALGO_MAP.keys():
+            logger.info(f"[DEBUG] Exact match found: {name}")
             return self.NAME_ALGO_MAP[name]
-
+        
         for key, value in self.NAME_ALGO_MAP.items():
-            if self.match_fn(key, name):
+            matches = self.match_fn(key, name)
+            logger.info(f"[DEBUG] Pattern '{key}' vs '{name}': {matches}")
+            if matches:
+                logger.info(f"[DEBUG] Matched! Returning config: {value}")
                 return value
-
+        
+        logger.info(f"[DEBUG] No match found for: {name}")
         return None
 
     def set_multiplier(self, multiplier):
@@ -549,9 +663,9 @@ class LycorisNetwork(torch.nn.Module):
         for lora in self.loras:
             lora.restore()
 
-    def merge_to(self, weight=1.0, *, precise: bool = False):
+    def merge_to(self, weight=1.0):
         for lora in self.loras:
-            lora.merge_to(weight, precise=precise)
+            lora.merge_to(weight)
 
     def onfly_merge(self, weight=1.0):
         for lora in self.loras:
@@ -571,10 +685,17 @@ class LycorisNetwork(torch.nn.Module):
             norms.append(norm)
             key_scaled += scaled
 
-        if key_scaled == 0:
-            return key_scaled, 0, 0
-
         return key_scaled, sum(norms) / len(norms), max(norms)
+    
+    @torch.no_grad()
+    def get_norms(self, device):
+        unscaled_norms = []
+        for module in self.loras:
+            unscaled_norm = module.get_norm(device)
+            if isinstance(unscaled_norm, torch.Tensor):
+                unscaled_norms.append(unscaled_norm)
+
+        return torch.stack(unscaled_norms)
 
     def enable_gradient_checkpointing(self):
         # not supported
@@ -597,7 +718,7 @@ class LycorisNetwork(torch.nn.Module):
 
         param_data = {"params": enumerate_params(self.loras)}
         if lr is not None:
-            param_data["lr"] = lr
+            param_data["lr"] = torch.tensor(lr)
         all_params.append(param_data)
         return all_params
 
@@ -628,6 +749,163 @@ class LycorisNetwork(torch.nn.Module):
             # Precalculate model hashes to save time on indexing
             if metadata is None:
                 metadata = {}
+
+            if "sshs_model_hash" not in metadata:
+                model_hash = precalculate_safetensors_hashes(state_dict)
+                metadata["sshs_model_hash"] = model_hash
+            metadata["wd_on_output"] = str(self.wd_on_output)
             save_file(state_dict, file, metadata)
         else:
             torch.save(state_dict, file)
+
+    @torch.no_grad()
+    def update_norms(self):
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.update_norms()
+
+    @torch.no_grad()
+    def update_grad_norms(self):
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.update_grad_norms()
+
+    @torch.no_grad()
+    def grad_norms(self) -> torch.Tensor:
+        """Efficiently collect gradient norms from all modules."""
+        # Use cached values when possible
+        if hasattr(self, '_cached_grad_norms') and self._grad_norm_cache_step == self._current_step:
+            return self._cached_grad_norms
+            
+        # Collect norms 
+        all_norms = []
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if hasattr(lora, "grad_norms") and lora.grad_norms is not None:
+                # Take mean of each module's gradient norms to get a scalar
+                try:
+                    module_norm = lora.grad_norms.mean()
+                    if isinstance(module_norm, torch.Tensor):
+                        all_norms.append(module_norm)
+                except:
+                    # Skip problematic modules
+                    continue
+        
+        # Create tensor from scalars (very efficient)
+        result = torch.stack(all_norms) if all_norms else torch.tensor([])
+        
+        # Cache the result
+        self._cached_grad_norms = result
+        self._grad_norm_cache_step = getattr(self, '_current_step', 0)
+        
+        return result
+
+    @torch.no_grad()
+    def weight_norms(self) -> torch.Tensor:
+        """Efficiently collect weight norms from all modules."""
+        # Use cached values when possible
+        if hasattr(self, '_cached_weight_norms') and self._weight_norm_cache_step == self._current_step:
+            return self._cached_weight_norms
+            
+        # Collect norms efficiently
+        all_norms = []
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if hasattr(lora, "weight_norms") and lora.weight_norms is not None:
+                try:
+                    module_norm = lora.weight_norms.mean()
+                    if isinstance(module_norm, torch.Tensor):
+                        all_norms.append(module_norm)
+                except:
+                    # Skip problematic modules
+                    continue
+        
+        # Create tensor from scalars
+        result = torch.stack(all_norms) if all_norms else torch.tensor([])
+        
+        # Cache the result
+        self._cached_weight_norms = result
+        self._weight_norm_cache_step = getattr(self, '_current_step', 0)
+        
+        return result
+
+    @torch.no_grad()
+    def combined_weight_norms(self) -> torch.Tensor:
+        """Efficiently collect combined weight norms from all modules."""
+        # Use cached values when possible
+        if hasattr(self, '_cached_combined_norms') and self._combined_weight_norm_cache_step == self._current_step:
+            return self._cached_combined_norms
+            
+        # Collect norms efficiently
+        all_norms = []
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if hasattr(lora, "combined_weight_norms") and lora.combined_weight_norms is not None:
+                try:
+                    module_norm = lora.combined_weight_norms.mean()
+                    if isinstance(module_norm, torch.Tensor):
+                        all_norms.append(module_norm)
+                except:
+                    # Skip problematic modules
+                    continue
+        
+        # Create tensor from scalars
+        result = torch.stack(all_norms) if all_norms else torch.tensor([])
+        
+        # Cache the result
+        self._cached_combined_norms = result
+        self._combined_weight_norm_cache_step = getattr(self, '_current_step', 0)
+        
+        return result
+    
+    @torch.no_grad()
+    def accumulate_grad(self):
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.accumulate_grad()
+
+    @torch.no_grad()
+    def sum_grads(self):
+        sum_grads = []
+        sum_squared_grads = []
+        count = 0
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if lora.sum_grads is not None:
+                sum_grads.append(lora.sum_grads)
+            if lora.sum_grads is not None:
+                sum_squared_grads.append(lora.sum_squared_grads)
+            count += lora.grad_count
+
+        return (
+            torch.stack(sum_grads) if len(sum_grads) > 0 else torch.tensor([]),
+            torch.stack(sum_squared_grads) if len(sum_squared_grads) > 0 else torch.tensor([]),
+            count
+        )
+
+    @torch.no_grad()
+    def gradient_noise_scale(self):
+        sum_grads, sum_squared_grads, count = self.sum_grads()
+
+        if count == 0:
+            return None, None
+
+        # Calculate mean gradient and mean squared gradient
+        mean_grad = torch.mean(sum_grads / count, dim=0)
+        mean_squared_grad = torch.mean(sum_squared_grads / count, dim=0)
+
+        # Variance = E[X²] - E[X]²
+        variance = mean_squared_grad - mean_grad**2
+
+        # GNS = trace(Σ) / ||μ||²
+        # trace(Σ) = sum of variances = count * variance (for uniform variance assumption)
+        trace_cov = count * variance
+        grad_norm_squared = count * mean_grad**2
+
+        gradient_noise_scale = trace_cov / grad_norm_squared
+        # mean_grad = torch.mean(all_grads, dim=0)
+        #
+        # # Calculate trace of covariance matrix
+        # centered_grads = all_grads - mean_grad
+        # trace_cov = torch.mean(torch.sum(centered_grads**2, dim=0))
+        #
+        # # Calculate norm of mean gradient squared
+        # grad_norm_squared = torch.sum(mean_grad**2)
+        #
+        # # Calculate GNS using provided gradient norm squared
+        # gradient_noise_scale = trace_cov / grad_norm_squared
+
+        return gradient_noise_scale, variance

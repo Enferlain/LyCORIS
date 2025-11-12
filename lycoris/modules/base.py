@@ -1,5 +1,4 @@
 from collections import OrderedDict
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -7,11 +6,16 @@ import torch.nn.functional as F
 import torch.nn.utils.parametrize as parametrize
 
 from ..utils.quant import QuantLinears, log_bypass, log_suspect
+from ..logging import logger
+from typing import Optional
+import math
+
+from ..utils.general import AID
 
 try:
-    from peft.tuners.tuners_utils import BaseTunerLayer
-except Exception:  # pragma: no cover - PEFT is optional
-    BaseTunerLayer = None
+    from ramtorch.modules.linear import CPUBouncingLinear
+except ImportError:
+    CPUBouncingLinear = None
 
 
 class ModuleCustomSD(nn.Module):
@@ -67,19 +71,6 @@ class ModuleCustomSD(nn.Module):
             )
 
 
-@dataclass
-class _MergeContext:
-    precise: bool
-    target_device: torch.device
-    target_dtype: torch.dtype
-    compute_dtype: torch.dtype
-    param_device: torch.device | None
-    param_dtype: torch.dtype | None
-    module: nn.Module
-    weight_param: torch.Tensor
-    bias_param: torch.Tensor | None
-
-
 class LycorisBaseModule(ModuleCustomSD):
     name: str
     dtype_tensor: torch.Tensor
@@ -89,32 +80,31 @@ class LycorisBaseModule(ModuleCustomSD):
 
     def __init__(
         self,
-        lora_name,
+        lora_name: str,
         org_module: nn.Module,
-        multiplier=1.0,
-        dropout=0.0,
-        rank_dropout=0.0,
-        module_dropout=0.0,
-        rank_dropout_scale=False,
-        bypass_mode=None,
+        multiplier: float = 1.0,
+        dropout: float = 0.0,
+        rank_dropout: float = 0.0,
+        module_dropout: float = 0.0,
+        rank_dropout_scale: bool = False,
+        bypass_mode: bool = False,
+        ggpo_beta: Optional[float] = None,
+        ggpo_sigma: Optional[float] = None,
+        ggpo_conv: bool = False,
+        ggpo_conv_weight_sample_size: int = 100,
         **kwargs,
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
         super().__init__()
         self.lora_name = lora_name
         self.not_supported = False
-
-        self.peft_wrapper = None
-        if BaseTunerLayer is not None and isinstance(org_module, BaseTunerLayer):
-            self.peft_wrapper = org_module
-            base_layer = getattr(org_module, "base_layer", None)
-            if base_layer is None and hasattr(org_module, "get_base_layer"):
-                base_layer = org_module.get_base_layer()
-            if base_layer is not None:
-                org_module = base_layer
+        self.grad_count = 0
+        self.sum_grads = None
+        self.sum_squared_grads = None
 
         self.module = type(org_module)
-        if isinstance(org_module, nn.Linear):
+        is_ramtorch_linear = CPUBouncingLinear is not None and isinstance(org_module, CPUBouncingLinear)
+        if isinstance(org_module, nn.Linear) or is_ramtorch_linear:
             self.module_type = "linear"
             self.shape = (org_module.out_features, org_module.in_features)
             self.op = F.linear
@@ -224,6 +214,42 @@ class LycorisBaseModule(ModuleCustomSD):
         self.org_forward = org_module.forward
         self.org_module = [org_module]
 
+        self.ggpo_sigma = ggpo_sigma
+        self.ggpo_beta = ggpo_beta
+        self.ggpo_conv = ggpo_conv
+        self.ggpo_conv_weight_sample_size = ggpo_conv_weight_sample_size
+
+    def _orthogonalize(self, weight_matrix: torch.Tensor) -> torch.Tensor:
+        """
+        Orthogonalizes the weight matrix using QR decomposition.
+        This is only active during training if `use_orthogonal_weights` is True.
+        """
+        if not self.use_orthogonal_weights or not self.training:
+            return weight_matrix
+
+        # QR decomposition works on 2D matrices.
+        # Conv weights can be > 2D, but LoKr factors are 2D.
+        shape = weight_matrix.shape
+        dimcount = len(shape)
+        if dimcount == 0:
+            return weight_matrix
+        elif dimcount > 2:
+            weight_matrix = weight_matrix.reshape(len(weight_matrix), -1) # Make 2D if conv or 1 dim
+        elif dimcount < 2:
+            weight_matrix = weight_matrix.reshape(1, -1) # Make 2D if conv or 1 dim
+        
+        # For matrices where rows >= cols, QR gives orthonormal columns.
+        # For matrices where rows < cols, we transpose to make columns from rows,
+        # apply QR, and transpose back. This results in orthonormal rows.
+        rows, cols = weight_matrix.shape
+        if rows >= cols:
+            q, r = torch.linalg.qr(weight_matrix)
+            weight_matrix = q * torch.diag(r)
+        else:
+            q, r = torch.linalg.qr(weight_matrix.T)
+            weight_matrix = (q * torch.diag(r)).T
+        return weight_matrix.reshape(shape).contiguous()
+
     @classmethod
     def parametrize(cls, org_module, attr, *args, **kwargs):
         from .full import FullModule
@@ -289,86 +315,34 @@ class LycorisBaseModule(ModuleCustomSD):
     def org_weight(self, value):
         self.org_module[0].weight.data.copy_(value)
 
-    def _current_weight(self):
-        return self.org_module[0].weight.detach()
-
-    def _current_bias(self):
-        bias = self.org_module[0].bias
-        return None if bias is None else bias.detach()
-
     def apply_to(self, **kwargs):
         if self.not_supported:
             return
-
-        module = self.org_module[0]
-        if not hasattr(module, "_lycoris_original_forward"):
-            module._lycoris_original_forward = module.forward
-
-        wrappers = list(getattr(module, "_lycoris_wrappers", []))
-        if self in wrappers:
-            wrappers.remove(self)
-
-        self.org_forward = module.forward
-        wrappers.append(self)
-
-        module._lycoris_wrappers = wrappers
-        module.forward = self.forward
+        self.org_forward = self.org_module[0].forward
+        self.org_module[0].forward = self.forward
 
     def restore(self):
         if self.not_supported:
             return
-        module = self.org_module[0]
-        wrappers = list(getattr(module, "_lycoris_wrappers", []))
+        self.org_module[0].forward = self.org_forward
 
-        if not wrappers:
-            module.forward = getattr(
-                module, "_lycoris_original_forward", self.org_forward
-            )
-            return
-
-        try:
-            idx = wrappers.index(self)
-        except ValueError:
-            module.forward = (
-                wrappers[-1].forward
-                if wrappers
-                else getattr(module, "_lycoris_original_forward", self.org_forward)
-            )
-            return
-
-        wrappers.pop(idx)
-
-        if idx < len(wrappers):
-            wrappers[idx].org_forward = self.org_forward
-
-        if wrappers:
-            module._lycoris_wrappers = wrappers
-            module.forward = wrappers[-1].forward
-        else:
-            module.forward = getattr(
-                module, "_lycoris_original_forward", self.org_forward
-            )
-            module.__dict__.pop("_lycoris_wrappers", None)
-            module.__dict__.pop("_lycoris_original_forward", None)
-
-    def merge_to(self, multiplier=1.0, *, precise: bool = False):
+    def merge_to(self, multiplier=1.0):
         if self.not_supported:
             return
-
-        ctx = self._prepare_merge_context(precise)
-
-        if precise:
-            weight_prec, bias_prec = self._compute_precise_result(ctx, multiplier)
-            self._apply_precise_weights(ctx, weight_prec, bias_prec)
-        else:
-            weight, bias = self.get_merged_weight(
-                multiplier,
-                ctx.weight_param.shape,
-                ctx.target_device,
-            )
-            self._apply_merged_weights(ctx, weight, bias)
-
-        self._restore_merge_context(ctx)
+        self_device = next(self.parameters()).device
+        self_dtype = next(self.parameters()).dtype
+        self.to(self.org_weight)
+        weight, bias = self.get_merged_weight(
+            multiplier, self.org_weight.shape, self.org_weight.device
+        )
+        self.org_weight = weight.to(self.org_weight)
+        if bias is not None:
+            bias = bias.to(self.org_weight)
+            if self.org_module[0].bias is not None:
+                self.org_module[0].bias.data.copy_(bias)
+            else:
+                self.org_module[0].bias = nn.Parameter(bias)
+        self.to(self_device, self_dtype)
 
     def onfly_merge(self, multiplier=1.0):
         if self.not_supported:
@@ -411,6 +385,10 @@ class LycorisBaseModule(ModuleCustomSD):
     @torch.no_grad()
     def apply_max_norm(self, max_norm, device=None):
         return None, None
+    
+    @torch.no_grad()
+    def get_norm(self, device=None):
+        return None, None
 
     def bypass_forward_diff(self, x, scale=1):
         raise NotImplementedError
@@ -425,182 +403,245 @@ class LycorisBaseModule(ModuleCustomSD):
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError
+    
+    @torch.no_grad()
+    def initialize_norm_cache(self, org_module_weight: torch.Tensor):
+        # Choose a reasonable sample size
+        n_rows = org_module_weight.shape[0]
+        sample_size = min(2000, n_rows)  # Cap at 2000 samples or use all if smaller
 
-    def _prepare_merge_context(self, precise: bool) -> _MergeContext:
-        module = self.org_module[0]
-        weight_param = module.weight
-        bias_param = module.bias
+        # Sample random indices across all rows
+        indices = torch.randperm(n_rows)[:sample_size]
 
-        params = tuple(self.parameters())
-        first_param = params[0] if params else None
-        param_device = first_param.device if first_param is not None else None
-        param_dtype = first_param.dtype if first_param is not None else None
+        # Convert to a supported data type first, then index
+        # Use float32 for indexing operations
+        weights_float32 = org_module_weight.to(dtype=torch.float32)
+        sampled_weights = weights_float32[indices].to(device=self.device)
 
-        target_device = weight_param.device
-        target_dtype = weight_param.dtype
-        compute_dtype = torch.float64 if precise else target_dtype
+        # Calculate sampled norms
+        sampled_norms = torch.norm(sampled_weights, dim=1, keepdim=True)
 
-        if first_param is not None:
-            self.to(device=target_device, dtype=compute_dtype)
+        # Store the mean norm as our estimate
+        self.org_weight_norm_estimate = sampled_norms.mean()
+
+        # Optional: store standard deviation for confidence intervals
+        self.org_weight_norm_std = sampled_norms.std()
+
+        # Free memory
+        del sampled_weights, weights_float32
+
+    @torch.no_grad()
+    def validate_norm_approximation(self, org_module_weight: torch.Tensor, verbose=True):
+        # Calculate the true norm (this will be slow but it's just for validation)
+        true_norms = []
+        chunk_size = 1024  # Process in chunks to avoid OOM
+
+        for i in range(0, org_module_weight.shape[0], chunk_size):
+            end_idx = min(i + chunk_size, org_module_weight.shape[0])
+            chunk = org_module_weight[i:end_idx].to(device=self.device, dtype=self.dtype)
+            chunk_norms = torch.norm(chunk, dim=1, keepdim=True)
+            true_norms.append(chunk_norms.cpu())
+            del chunk
+
+        true_norms = torch.cat(true_norms, dim=0)
+        true_mean_norm = true_norms.mean().item()
+
+        # Compare with our estimate
+        estimated_norm = self.org_weight_norm_estimate.item()
+
+        # Calculate error metrics
+        absolute_error = abs(true_mean_norm - estimated_norm)
+        relative_error = absolute_error / true_mean_norm * 100  # as percentage
+
+        if verbose:
+            logger.info(f"True mean norm: {true_mean_norm:.6f}")
+            logger.info(f"Estimated norm: {estimated_norm:.6f}")
+            logger.info(f"Absolute error: {absolute_error:.6f}")
+            logger.info(f"Relative error: {relative_error:.2f}%")
+
+        return {
+            'true_mean_norm': true_mean_norm,
+            'estimated_norm': estimated_norm,
+            'absolute_error': absolute_error,
+            'relative_error': relative_error
+        }
+
+    @torch.no_grad()
+    def update_norms(self):
+        # Early returns for common cases
+        if self.ggpo_beta is None or self.ggpo_sigma is None or not self.training:
+            return
+        
+        if not(self.module_type == "linear" or (self.module_type.startswith("conv") and self.ggpo_conv)):
+            return
+        
+        if not (hasattr(self, 'lora_down') and hasattr(self.lora_down, 'weight') and self.lora_down.weight.grad is not None):
+            return
+        
+        if not (hasattr(self, 'lora_up') and hasattr(self.lora_up, 'weight') and self.lora_down.weight.grad is not None):
+            return
+        
+        # Skip update every other step for convolutions to reduce overhead
+        if self.module_type != "linear" and hasattr(self, '_skip_counter'):
+            self._skip_counter = not self._skip_counter
+            if self._skip_counter:
+                return
         else:
-            self.to(target_device)
-            if precise:
-                self.to(dtype=compute_dtype)
-
-        if precise:
-            self._ensure_precise_snapshot(module, weight_param, bias_param)
-            self._load_precise_snapshot(
-                module,
-                weight_param,
-                bias_param,
-                target_device,
-                compute_dtype,
+            self._skip_counter = False
+        
+        # Fast path for linear layers
+        if self.module_type == "linear":
+            # Calculate norms directly without forming the full weight matrix
+            up_norm = torch.sum(self.lora_up.weight**2)
+            down_norm = torch.sum(self.lora_down.weight**2)
+            
+            # Frobenius norm of the product can be bounded/approximated 
+            effect = torch.sqrt(up_norm * down_norm) * self.scale
+            
+            # Calculate per-output channel distribution (much faster than full matrix mul)
+            up_channel_norms = torch.sum(self.lora_up.weight**2, dim=1, keepdim=True)
+            total_norm = up_channel_norms.sum()
+            
+            # Avoid division by zero and normalize
+            self.weight_norms = up_channel_norms * (effect / total_norm)
+            self.combined_weight_norms = torch.sqrt(
+                (self.org_weight_norm_estimate**2) + self.weight_norms**2
             )
-
-        return _MergeContext(
-            precise=precise,
-            target_device=target_device,
-            target_dtype=target_dtype,
-            compute_dtype=compute_dtype,
-            param_device=param_device,
-            param_dtype=param_dtype,
-            module=module,
-            weight_param=weight_param,
-            bias_param=bias_param,
-        )
-
-    def _apply_merged_weights(
-        self,
-        ctx: _MergeContext,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> None:
-        merged_weight = weight.to(ctx.target_dtype)
-        ctx.weight_param.data.copy_(merged_weight)
-
-        if bias is not None:
-            merged_bias = bias.to(ctx.target_dtype)
-            if ctx.bias_param is not None:
-                ctx.bias_param.data.copy_(merged_bias)
-            else:
-                ctx.module.bias = nn.Parameter(merged_bias)
-        elif ctx.bias_param is None:
-            ctx.module.bias = None
-
-        if ctx.precise:
-            ctx.module._lycoris_precise_weight_current = weight.to(torch.float64).cpu()
-            if ctx.bias_param is not None:
-                if bias is not None:
-                    ctx.module._lycoris_precise_bias_current = bias.to(
-                        torch.float64
-                    ).cpu()
+            return
+        
+        if self.module_type.startswith("conv") and self.ggpo_conv:
+            # Handle convolution layers - use sampling for efficiency
+            # Sample-based estimation for convolution layers
+            out_size = self.lora_up.weight.size(0)
+            
+            # Use a constant estimation factor based on typical CNN properties
+            # This avoids expensive reconstruction while capturing essential scaling
+            if not hasattr(self, 'conv_norm_estimate'):
+                # Cache this value since it's relatively constant
+                up = self.lora_up.weight
+                down = self.lora_down.weight
+                
+                # Sample a small subset of weights to estimate norm
+                sample_size = min(self.ggpo_conv_weight_sample_size, up.size(0))
+                if sample_size < up.size(0):
+                    up_indices = torch.randperm(up.size(0))[:sample_size]
+                    up_sample = up[up_indices]
                 else:
-                    ctx.module._lycoris_precise_bias_current = (
-                        ctx.module._lycoris_precise_bias_base
-                    )
+                    up_sample = up
+                    
+                sample_size = min(self.ggpo_conv_weight_sample_size, down.size(0))
+                if sample_size < down.size(0):
+                    down_indices = torch.randperm(down.size(0))[:sample_size]
+                    down_sample = down[down_indices]
+                else:
+                    down_sample = down
+                
+                # Calculate squared Frobenius norms on samples
+                up_norm_sq = torch.sum(up_sample**2) * (up.size(0) / up_sample.size(0))
+                down_norm_sq = torch.sum(down_sample**2) * (down.size(0) / down_sample.size(0))
+                
+                # Cache the estimation factor
+                self.conv_norm_estimate = torch.sqrt(up_norm_sq * down_norm_sq) * self.scale
+            
+            # Calculate per-channel output scaling - much faster than full norm calculation
+            up_flat = self.lora_up.weight.view(out_size, -1)
+            up_channel_norms = torch.sum(up_flat**2, dim=1, keepdim=True)
+            channel_sum = up_channel_norms.sum()
+            
+            # Distribute the precomputed norm across channels
+            self.weight_norms = up_channel_norms * (self.conv_norm_estimate / channel_sum)
+            self.combined_weight_norms = torch.sqrt(
+                (self.org_weight_norm_estimate**2) + self.weight_norms**2
+            )
 
-    def _restore_merge_context(self, ctx: _MergeContext) -> None:
-        if ctx.param_device is not None and ctx.param_dtype is not None:
-            self.to(device=ctx.param_device, dtype=ctx.param_dtype)
-        elif ctx.param_device is not None:
-            self.to(ctx.param_device)
-        elif ctx.param_dtype is not None:
-            self.to(dtype=ctx.param_dtype)
 
-    def _compute_precise_result(
-        self, ctx: _MergeContext, multiplier: float
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        base_weight = ctx.module._lycoris_precise_weight_current
-        diff_weight, diff_bias = self.get_diff_weight(
-            multiplier=1.0, device=ctx.target_device
-        )
-        diff_weight_prec = diff_weight.to(torch.float64).cpu()
-        new_weight = base_weight + diff_weight_prec * multiplier
-
-        new_bias = None
-        if diff_bias is not None:
-            diff_bias_prec = diff_bias.to(torch.float64).cpu()
-            base_bias = ctx.module._lycoris_precise_bias_current
-            if base_bias is None:
-                base_bias = torch.zeros_like(diff_bias_prec)
-            new_bias = base_bias + diff_bias_prec * multiplier
+    @torch.no_grad()
+    def update_grad_norms(self):
+        if not self.training:
+            return
+        
+        if not(self.module_type == "linear" or (self.module_type.startswith("conv") and self.ggpo_conv)):
+            return
+        
+        if not (hasattr(self, 'lora_down') and hasattr(self.lora_down, 'weight') and self.lora_down.weight.grad is not None):
+            return
+        
+        if not (hasattr(self, 'lora_up') and hasattr(self.lora_up, 'weight') and self.lora_down.weight.grad is not None):
+            return
+            
+        # Skip update every other step for convolutions to reduce overhead
+        if self.module_type != "linear" and hasattr(self, '_skip_grad_counter'):
+            self._skip_grad_counter = not self._skip_grad_counter
+            if self._skip_grad_counter:
+                return
         else:
-            new_bias = ctx.module._lycoris_precise_bias_current
+            self._skip_grad_counter = False
 
-        ctx.module._lycoris_precise_weight_current = new_weight.clone()
-        if diff_bias is not None:
-            ctx.module._lycoris_precise_bias_current = (
-                new_bias.clone() if new_bias is not None else None
-            )
+        # Use direct parameter access instead of named iteration (faster)
+        lora_down_grad = self.lora_down.weight.grad
+        lora_up_grad = self.lora_up.weight.grad
+        
+        # Fast path for linear layers
+        if self.module_type == "linear":
+            # Calculate gradient norms efficiently using matrix properties
+            lora_up_weight = self.lora_up.weight
+            lora_down_weight = self.lora_down.weight
+            
+            # For linear layers, directly calculate gradient approximation
+            up_down_grad = self.scale * (lora_up_weight @ lora_down_grad)
+            up_grad_down = self.scale * (lora_up_grad @ lora_down_weight)
+            
+            # Sum the gradient components
+            approx_grad = up_down_grad + up_grad_down
+            
+            # Calculate row-wise norms
+            self.grad_norms = torch.norm(approx_grad, dim=1, keepdim=True)
+        
+        if self.module_type.startswith("conv") and self.ggpo_conv:
+            # Use a fast approximation for convolution gradients
+            out_size = self.lora_up.weight.size(0)
+            
+            # Calculate gradient magnitude using norm products (faster than reconstruction)
+            up_grad_norm = torch.norm(lora_up_grad.view(-1))
+            down_weight_norm = torch.norm(self.lora_down.weight.view(-1))
+            up_weight_norm = torch.norm(self.lora_up.weight.view(-1))
+            down_grad_norm = torch.norm(lora_down_grad.view(-1))
+            
+            # Approximation of the combined gradient magnitude
+            grad_magnitude = self.scale * (up_grad_norm * down_weight_norm + up_weight_norm * down_grad_norm)
+            
+            # Distribute gradient magnitude across output channels
+            # This avoids expensive per-channel calculations while capturing key behavior
+            up_channel_magnitudes = torch.norm(self.lora_up.weight.view(out_size, -1), dim=1, keepdim=True)
+            magnitude_sum = up_channel_magnitudes.sum()
+            
+            # Distribute based on weight magnitudes (channels with larger weights get larger gradients)
+            self.grad_norms = up_channel_magnitudes * (grad_magnitude / magnitude_sum)
 
-        return new_weight, new_bias
+    @torch.no_grad()
+    def init_ggpo(self):
+        if self.ggpo_beta is not None and self.ggpo_sigma is not None:
+            self.combined_weight_norms = None
+            self.grad_norms = None
+            self.weight_norms = None
+            self.perturbation_norm_factor = 1.0 / math.sqrt(self.org_module[0].weight.shape[0])
+            self.initialize_norm_cache(self.org_module[0].weight)
+            self.org_module_shape: tuple[int] = self.org_module[0].weight.shape
 
-    def _apply_precise_weights(
-        self,
-        ctx: _MergeContext,
-        weight_prec: torch.Tensor,
-        bias_prec: torch.Tensor | None,
-    ) -> None:
-        ctx.weight_param.data.copy_(weight_prec.to(ctx.target_device, ctx.target_dtype))
+    @torch.no_grad()
+    def accumulate_grad(self):
+        for param in self.parameters():
+            if param.grad is not None:
+                grad = param.grad.detach().flatten()
+                self.grad_count += grad.numel()
 
-        if bias_prec is not None:
-            if ctx.bias_param is not None:
-                ctx.bias_param.data.copy_(
-                    bias_prec.to(ctx.target_device, ctx.target_dtype)
-                )
-            else:
-                ctx.module.bias = nn.Parameter(
-                    bias_prec.to(ctx.target_device, ctx.target_dtype)
-                )
-        elif ctx.bias_param is None:
-            ctx.module.bias = None
+                # Update running sums
+                if self.sum_grads is None:
+                    self.sum_grads = grad.sum()
+                    self.sum_squared_grads = (grad**2).sum()
+                else:
+                    self.sum_grads += grad.sum()
+                    self.sum_squared_grads += (grad**2).sum()
 
-    @staticmethod
-    def _ensure_precise_snapshot(
-        module: nn.Module,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> None:
-        if not hasattr(module, "_lycoris_precise_weight_base"):
-            base = weight.detach().cpu().double()
-            module._lycoris_precise_weight_base = base
-            module._lycoris_precise_weight_current = base.clone()
-        if not hasattr(module, "_lycoris_precise_weight_current"):
-            module._lycoris_precise_weight_current = (
-                module._lycoris_precise_weight_base.clone()
-            )
-
-        if not hasattr(module, "_lycoris_precise_bias_base"):
-            if bias is not None:
-                base_bias = bias.detach().cpu().double()
-            else:
-                base_bias = None
-            module._lycoris_precise_bias_base = base_bias
-            module._lycoris_precise_bias_current = (
-                base_bias.clone() if base_bias is not None else None
-            )
-        if not hasattr(module, "_lycoris_precise_bias_current"):
-            module._lycoris_precise_bias_current = (
-                module._lycoris_precise_bias_base.clone()
-                if module._lycoris_precise_bias_base is not None
-                else None
-            )
-
-    @staticmethod
-    def _load_precise_snapshot(
-        module: nn.Module,
-        weight_param: torch.Tensor,
-        bias_param: torch.Tensor | None,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        weight_param.data.copy_(
-            module._lycoris_precise_weight_current.to(device=device, dtype=dtype)
-        )
-        if bias_param is not None:
-            bias_snapshot = module._lycoris_precise_bias_current
-            if bias_snapshot is None and module._lycoris_precise_bias_base is not None:
-                bias_snapshot = module._lycoris_precise_bias_base
-                module._lycoris_precise_bias_current = bias_snapshot
-            if bias_snapshot is not None:
-                bias_param.data.copy_(bias_snapshot.to(device=device, dtype=dtype))
+    def ggpo_pertubation(self, x):
+        return None
