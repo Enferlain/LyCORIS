@@ -36,170 +36,205 @@ def log_bypass_override():
 
 class _BouncingLinearDiffMixFn(torch.autograd.Function):
     """
-    Custom autograd function for memory-efficient mixed streaming.
-    It sequentially streams a base weight and a diff weight into a single
-    GPU buffer slot to compute a blended output, respecting autocast dtypes.
+    Mixed streaming for Full on CPUBouncingLinear:
+    - Reuse pinned CPU params (no clones)
+    - Use two ping-pong slots per call (idx, other)
+    - Overlap W_diff copy with base GEMM
+    - Stage backward copies on transfer streams
+    - Preserve ramtorch hook order
     """
-    @staticmethod
     def forward(ctx, x, w_org_cpu, b_org_cpu, w_diff_cpu, b_diff_cpu, scale, device="cuda"):
         autocast_enabled = torch.is_autocast_enabled()
-        autocast_dtype = torch.get_autocast_gpu_dtype() if autocast_enabled else None
+        compute_dtype = torch.get_autocast_gpu_dtype() if autocast_enabled else x.dtype
+        x_c = x.to(compute_dtype) if x.dtype != compute_dtype else x
 
         state = _get_device_state(device)
         ts = state["transfer_stream"]
-        tf_event = state["transfer_forward_finished_event"]
         cs_start = state["compute_forward_start_event"]
-        w_buf = state["w_buffers"]
-        b_buf = state["b_buffers"]
+        w_bufs = state["w_buffers"]
+        b_bufs = state["b_buffers"]
 
+        # Per-call events to avoid reuse races
+        base_done = torch.cuda.Event()
+        diff_done = torch.cuda.Event()
+
+        def _ensure_slot(slot_t, like_cpu, dev):
+            if slot_t is None or slot_t.shape != like_cpu.shape or slot_t.dtype != like_cpu.dtype or slot_t.device.index != torch.cuda.current_device():
+                return torch.empty_like(like_cpu, device=dev)
+            return slot_t
+
+        # Use only one global slot per call to avoid cross-layer contention
         idx = state["forward_clk"]
         state["forward_clk"] ^= 1
-        
-        compute_dtype = autocast_dtype if autocast_enabled else x.dtype
-        x_c = x.to(compute_dtype)
 
-        # 1. Stream W_org and compute base output
+        # Base transfer on transfer stream, gated by cs_start
         with torch.cuda.stream(ts):
             ts.wait_event(cs_start)
-            w_buf[idx] = w_org_cpu.to(device, non_blocking=True)
-            b_buf[idx] = b_org_cpu.to(device, non_blocking=True) if b_org_cpu is not None else None
-            tf_event.record()
-        torch.cuda.current_stream().wait_event(tf_event)
-        cs_start.record()
-        
-        w_c = w_buf[idx].to(compute_dtype)
-        b_c = b_buf[idx].to(compute_dtype) if b_buf[idx] is not None else None
-        y = torch.nn.functional.linear(x_c, w_c, b_c)
+            w_bufs[idx] = _ensure_slot(w_bufs[idx], w_org_cpu, device)
+            w_bufs[idx].copy_(w_org_cpu, non_blocking=True)
+            if b_org_cpu is not None:
+                b_bufs[idx] = _ensure_slot(b_bufs[idx], b_org_cpu, device)
+                b_bufs[idx].copy_(b_org_cpu, non_blocking=True)
+            else:
+                b_bufs[idx] = None
+            base_done.record()
 
-        # 2. Stream W_diff into the *same* buffer and compute delta
+        # Compute waits only for base transfer; record cs_start to release others
+        comp = torch.cuda.current_stream()
+        comp.wait_event(base_done)
+        cs_start.record()
+        w_base = w_bufs[idx] if w_bufs[idx].dtype == compute_dtype else w_bufs[idx].to(compute_dtype)
+        b_base = None if b_bufs[idx] is None else (b_bufs[idx] if b_bufs[idx].dtype == compute_dtype else b_bufs[idx].to(compute_dtype))
+        y = torch.nn.functional.linear(x_c, w_base, b_base)
+
+        # Diff transfer reuses the same slot after base compute started
         with torch.cuda.stream(ts):
             ts.wait_event(cs_start)
-            w_buf[idx] = w_diff_cpu.to(device, non_blocking=True)
-            b_buf[idx] = b_diff_cpu.to(device, non_blocking=True) if b_diff_cpu is not None else None
-            tf_event.record()
-        torch.cuda.current_stream().wait_event(tf_event)
+            w_bufs[idx].copy_(w_diff_cpu, non_blocking=True)
+            if b_diff_cpu is not None:
+                if b_bufs[idx] is None or b_bufs[idx].shape != b_diff_cpu.shape or b_bufs[idx].dtype != b_diff_cpu.dtype:
+                    b_bufs[idx] = torch.empty_like(b_diff_cpu, device=device)
+                b_bufs[idx].copy_(b_diff_cpu, non_blocking=True)
+            else:
+                b_bufs[idx] = None
+            diff_done.record()
+
+        # Compute waits for diff transfer; record cs_start again for downstream
+        comp.wait_event(diff_done)
         cs_start.record()
-
-        w_c = w_buf[idx].to(compute_dtype)
-        b_c = b_buf[idx].to(compute_dtype) if b_buf[idx] is not None else None
-        y_delta = torch.nn.functional.linear(x_c, w_c, b_c)
-
-        # 3) Blend and cast back appropriately
+        w_diff = w_bufs[idx] if w_bufs[idx].dtype == compute_dtype else w_bufs[idx].to(compute_dtype)
+        b_diff = None if b_bufs[idx] is None else (b_bufs[idx] if b_bufs[idx].dtype == compute_dtype else b_bufs[idx].to(compute_dtype))
+        y_delta = torch.nn.functional.linear(x_c, w_diff, b_diff)
         y.add_(y_delta, alpha=float(scale))
-        if torch.is_autocast_enabled():
-            y = y.to(torch.get_autocast_gpu_dtype())
-        else:
-            y = y.to(x.dtype)
 
-        # Save tensors for backward
-        b_org_sentinel = x.new_zeros(0) if b_org_cpu is None else b_org_cpu
-        b_diff_sentinel = x.new_zeros(0) if b_diff_cpu is None else b_diff_cpu
-        ctx.save_for_backward(x, w_org_cpu, b_org_sentinel, w_diff_cpu, b_diff_sentinel)
+        # Save for backward
+        b_org_s = x.new_zeros(0) if b_org_cpu is None else b_org_cpu
+        b_diff_s = x.new_zeros(0) if b_diff_cpu is None else b_diff_cpu
+        ctx.save_for_backward(x, w_org_cpu, b_org_s, w_diff_cpu, b_diff_s)
         ctx.device = device
         ctx.scale = float(scale)
-        # Optional: if you want backward to know whether autocast was on
-        ctx.autocast_enabled = torch.is_autocast_enabled()
-        ctx.autocast_dtype = torch.get_autocast_gpu_dtype() if ctx.autocast_enabled else None
+        ctx.compute_dtype = compute_dtype
         return y
 
     @staticmethod
     def backward(ctx, grad_out):
-        # Unpack all saved tensors (bias entries may be empty sentinels)
         x, w_org_cpu, b_org_s, w_diff_cpu, b_diff_s = ctx.saved_tensors
-        b_org_cpu  = None if b_org_s.numel()  == 0 else b_org_s
+        b_org_cpu = None if b_org_s.numel() == 0 else b_org_s
         b_diff_cpu = None if b_diff_s.numel() == 0 else b_diff_s
 
         device, s = ctx.device, ctx.scale
-
         state = _get_device_state(device)
-        ts, tgs = state["transfer_stream"], state["transfer_grad_stream"]
-        wbw, wg, bg = state["w_bwd_buffers"], state["w_grad_buffers"], state["b_grad_buffers"]
-        wga, bga = state["w_grad_accum_buffers"], state["b_grad_accum_buffers"]
-        tb_event = state["transfer_backward_finished_event"]
-        cs_start, cs_done = state["compute_backward_start_event"], state["compute_backward_finished_event"]
-        twb_event = state["transfer_weight_backward_finished_event"]
+        ts = state["transfer_stream"]
+        tgs = state["transfer_grad_stream"]
+        cs_start = state["compute_backward_start_event"]
+        cs_done = state["compute_backward_finished_event"]
 
+        wbw = state["w_bwd_buffers"]
+        wg_bufs = state["w_grad_buffers"]
+        bg_bufs = state["b_grad_buffers"]
+        wga = state["w_grad_accum_buffers"]
+        bga = state["b_grad_accum_buffers"]
+
+        base_bwd_done = torch.cuda.Event()
+        diff_bwd_done = torch.cuda.Event()
+
+        def _ensure(shape, dtype, buf):
+            if buf is None or tuple(buf.shape) != tuple(shape) or buf.dtype != dtype or buf.device.index != torch.cuda.current_device():
+                return torch.empty(shape, dtype=dtype, device=device)
+            return buf
+
+        # Single slot for staging
         idx = state["backward_clk"]
         state["backward_clk"] ^= 1
 
+        # Stage W_org first
         with torch.cuda.stream(ts):
             ts.wait_event(cs_start)
-            wbw[idx] = w_diff_cpu.to(device, non_blocking=True)
-            wga[idx] = w_diff_cpu.grad.to(device, non_blocking=True) if w_diff_cpu.grad is not None else None
-            bga[idx] = b_diff_cpu.grad.to(device, non_blocking=True) if (b_diff_cpu is not None and b_diff_cpu.grad is not None) else None
-            tb_event.record()
-        torch.cuda.current_stream().wait_event(tb_event)
+            wbw[idx] = _ensure(w_org_cpu.shape, grad_out.dtype, wbw[idx])
+            wbw[idx].copy_(w_org_cpu.to(dtype=grad_out.dtype), non_blocking=True)
+            base_bwd_done.record()
+
+        comp = torch.cuda.current_stream()
+        comp.wait_event(base_bwd_done)
         cs_start.record()
 
-        # ND-safe grad_input; keep in grad_out.dtype
-        w_org_gpu = w_org_cpu.to(device, non_blocking=True, dtype=grad_out.dtype)
-        grad_input = grad_out @ w_org_gpu
-        w_diff_gpu = wbw[idx].to(dtype=grad_out.dtype)
-        grad_input.add_(grad_out @ w_diff_gpu, alpha=s)
+        # Start building grad_input with W_org
+        grad_input = grad_out.matmul(wbw[idx])
 
-        # Weight grad in compute dtype, then cast to param dtype
-        go_2d = grad_out.flatten(0, -2)
-        x_2d  = x.to(grad_out.dtype).flatten(0, -2)
-        wg[idx] = (go_2d.T @ x_2d)
-        wg[idx].mul_(s)
+        # Stage W_diff into same slot (overwrite) and finish grad_input
+        with torch.cuda.stream(ts):
+            ts.wait_event(cs_start)
+            wbw[idx].copy_(w_diff_cpu.to(dtype=grad_out.dtype), non_blocking=True)
+            diff_bwd_done.record()
 
-        # Bias grad: compute in compute dtype (or fp32), then cast to param dtype
+        comp.wait_event(diff_bwd_done)
+        cs_start.record()
+        grad_input.add_(grad_out.matmul(wbw[idx]), alpha=s)
+
+        # Compute diff grads in FP32 for stability, then cast back
+        go_2d = grad_out.flatten(0, -2).to(torch.float32)
+        x_2d = x.flatten(0, -2).to(torch.float32)
+        w_grad_32 = go_2d.t().matmul(x_2d)
+        if s != 1.0:
+            w_grad_32.mul_(s)
+
+        wg_bufs[idx] = _ensure(w_diff_cpu.shape, torch.float32, wg_bufs[idx])
+        wg_bufs[idx].copy_(w_grad_32, non_blocking=True)
+
         if b_diff_cpu is not None:
             reduce_dims = tuple(range(grad_out.ndim - 1))
-            bg[idx] = grad_out.sum(dim=reduce_dims)
-            bg[idx].mul_(s)
+            b_grad_32 = grad_out.sum(dim=reduce_dims).to(torch.float32)
+            if s != 1.0:
+                b_grad_32.mul_(s)
+            bg_bufs[idx] = _ensure((b_grad_32.shape[-1],), torch.float32, bg_bufs[idx])
+            bg_bufs[idx].copy_(b_grad_32, non_blocking=True)
         else:
-            bg[idx] = None
+            bg_bufs[idx] = None
 
-        # Cast grads to parameter dtypes before hooks/accum
-        target_w_dtype = w_diff_cpu.dtype
-        wg[idx] = wg[idx].to(target_w_dtype)
-        if wga[idx] is not None:
-            wg[idx].add_(wga[idx].to(target_w_dtype))
+        # Cast to param dtype and add any staged accum of matching shape
+        tw_dtype = w_diff_cpu.dtype
+        if wg_bufs[idx].dtype != tw_dtype:
+            wg_bufs[idx] = wg_bufs[idx].to(tw_dtype)
+        if wga[idx] is not None and tuple(wga[idx].shape) == tuple(wg_bufs[idx].shape):
+            wg_bufs[idx].add_(wga[idx].to(tw_dtype))
 
         if b_diff_cpu is not None:
-            target_b_dtype = b_diff_cpu.dtype
-            bg[idx] = bg[idx].to(target_b_dtype)
-            if bga[idx] is not None:
-                bg[idx].add_(bga[idx].to(target_b_dtype))
+            tb_dtype = b_diff_cpu.dtype
+            if bg_bufs[idx].dtype != tb_dtype:
+                bg_bufs[idx] = bg_bufs[idx].to(tb_dtype)
+            if bga[idx] is not None and tuple(bga[idx].shape) == tuple(bg_bufs[idx].shape):
+                bg_bufs[idx].add_(bga[idx].to(tb_dtype))
 
         cs_done.record()
 
-        # Hook invocation and CPU assignment
+        # Hook order and async CPU assignment on grad stream
         with torch.cuda.stream(tgs):
             tgs.wait_event(cs_done)
 
-            # Optional: ZeRO-2 hooks on GPU grads (match ramtorch order)
             if _invoke_zero_2_tensor_hooks is not None:
-                wg[idx] = _invoke_zero_2_tensor_hooks(w_diff_cpu, wg[idx])
+                wg_bufs[idx] = _invoke_zero_2_tensor_hooks(w_diff_cpu, wg_bufs[idx])
                 if b_diff_cpu is not None:
-                    bg[idx] = _invoke_zero_2_tensor_hooks(b_diff_cpu, bg[idx])
+                    bg_bufs[idx] = _invoke_zero_2_tensor_hooks(b_diff_cpu, bg_bufs[idx])
 
-            # Backward hooks then post-accum hooks
-            wg[idx] = _invoke_tensor_hooks(w_diff_cpu, wg[idx])
-            w_diff_cpu.ramtorch_grad = wg[idx]
+            wg_bufs[idx] = _invoke_tensor_hooks(w_diff_cpu, wg_bufs[idx])
+            w_diff_cpu.ramtorch_grad = wg_bufs[idx]
             _invoke_post_accum_tensor_hooks(w_diff_cpu)
             del w_diff_cpu.ramtorch_grad
 
             if b_diff_cpu is not None:
-                bg[idx] = _invoke_tensor_hooks(b_diff_cpu, bg[idx])
-                b_diff_cpu.ramtorch_grad = bg[idx]
+                bg_bufs[idx] = _invoke_tensor_hooks(b_diff_cpu, bg_bufs[idx])
+                b_diff_cpu.ramtorch_grad = bg_bufs[idx]
                 _invoke_post_accum_tensor_hooks(b_diff_cpu)
                 del b_diff_cpu.ramtorch_grad
 
-            # Just before final CPU assignment in backward
             if w_diff_cpu.is_cuda:
-                raise RuntimeError("ramtorch diff param moved to CUDA; ensure FullModule._apply keeps it on CPU")
+                raise RuntimeError("ramtorch diff param moved to CUDA; keep diff params on CPU")
 
-            # Final CPU assignment; dtypes now match parameter dtypes
-            w_diff_cpu.grad = wg[idx].to("cpu", non_blocking=True)
+            w_diff_cpu.grad = wg_bufs[idx].to("cpu", non_blocking=True)
             if b_diff_cpu is not None:
-                b_diff_cpu.grad = bg[idx].to("cpu", non_blocking=True)
-
-            twb_event.record()
+                b_diff_cpu.grad = bg_bufs[idx].to("cpu", non_blocking=True)
 
         return grad_input, None, None, None, None, None, None
-
 
 class FullModule(LycorisBaseModule):
     name = "full"
@@ -225,17 +260,14 @@ class FullModule(LycorisBaseModule):
         ggpo_sigma: Optional[float] = None,
         **kwargs,
     ):
-        super().__init__(
-            lora_name, org_module, multiplier, dropout, rank_dropout,
-            module_dropout, rank_dropout_scale, bypass_mode, ggpo_beta, ggpo_sigma, **kwargs
-        )
+        super().__init__(lora_name, org_module, multiplier, dropout, rank_dropout,
+                         module_dropout, rank_dropout_scale, bypass_mode, ggpo_beta, ggpo_sigma, **kwargs)
         if self.module_type not in self.support_module:
             raise ValueError(f"{self.module_type} is not supported in Full algo.")
 
         self._use_ramtorch_linear = (
             CPUBouncingLinear is not None and _get_device_state is not None
-            and isinstance(org_module, CPUBouncingLinear)
-            and self.module_type == "linear"
+            and isinstance(org_module, CPUBouncingLinear) and self.module_type == "linear"
         )
 
         if self.is_quant and not self._use_ramtorch_linear:
@@ -244,6 +276,7 @@ class FullModule(LycorisBaseModule):
             raise ValueError("Bypass mode is not supported in Full algo.")
 
         if self._use_ramtorch_linear:
+            # Pinned diff params on CPU; mark for ramtorch
             self.diff_weight = nn.Parameter(torch.zeros_like(org_module.weight, device="cpu").pin_memory())
             self.diff_weight.is_ramtorch = True
             if org_module.bias is not None:
@@ -258,12 +291,14 @@ class FullModule(LycorisBaseModule):
             else:
                 self.register_parameter("bias", None)
 
-        self.is_diff = True
-        self._org_weight = [self.org_module[0].weight.data.cpu().clone()]
-        if self.org_module[0].bias is not None:
-            self.org_bias = [self.org_module[0].bias.data.cpu().clone()]
+        # IMPORTANT: keep direct references to ramtorch's pinned base params, not CPU clones
+        if self._use_ramtorch_linear:
+            self._org_weight = [self.org_module[0].weight]  # CPUBouncingLinear param on pinned CPU
+            self.org_bias = [self.org_module[0].bias] if self.org_module[0].bias is not None else None
         else:
-            self.org_bias = None
+            self.is_diff = False  # non-ramtorch path will merge into weight/bias
+            self._org_weight = [self.org_module[0].weight.data.cpu().clone()]
+            self.org_bias = [self.org_module[0].bias.data.cpu().clone()] if self.org_module[0].bias is not None else None
 
     @classmethod
     def make_module_from_state_dict(cls, lora_name, orig_module, diff, diff_b):
@@ -279,27 +314,24 @@ class FullModule(LycorisBaseModule):
         return module
 
     def _apply(self, fn):
-        # Prevent diff params from being moved off CPU by .to()/prepare()
+        # Prevent diff params from moving off CPU; allow dtype changes
         if getattr(self, "_use_ramtorch_linear", False):
-            # Probe target transform
             probe = torch.empty(0, device="cpu", dtype=self.diff_weight.dtype)
             out = fn(probe)
-            target_dtype = out.dtype  # target device is ignored for diff params
+            target_dtype = out.dtype
 
-            # Allow dtype change on CPU-pinned tensors
             if self.diff_weight is not None and self.diff_weight.dtype != target_dtype:
                 self.diff_weight.data = self.diff_weight.data.to(dtype=target_dtype)
             if getattr(self, "diff_bias", None) is not None and self.diff_bias.dtype != target_dtype:
                 self.diff_bias.data = self.diff_bias.data.to(dtype=target_dtype)
 
-            # Apply transform to child modules/buffers (there shouldn't be parameters to move here)
+            # children/buffers transform only
             for m in self.children():
                 m._apply(fn)
             for name, buf in self._buffers.items():
                 if buf is not None:
                     self._buffers[name] = fn(buf)
             return self
-        # Non-ramtorch path: default behavior
         return super()._apply(fn)
 
     def apply_to(self, **kwargs):
