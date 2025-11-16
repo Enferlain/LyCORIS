@@ -194,47 +194,86 @@ class FullModule(LycorisBaseModule):
             raise ValueError(f"{self.module_type} is not supported in Full algo.")
 
         self._use_ramtorch_linear = (
-            CPUBouncingLinear is not None
-            and _get_device_state is not None
+            CPUBouncingLinear is not None and _get_device_state is not None
             and isinstance(org_module, CPUBouncingLinear)
             and self.module_type == "linear"
         )
 
-        # Snapshot original weights/bias on CPU (used as 'org' in Full)
+        # NEW: optional direct mode for ramtorch (default True here)
+        self.direct_ramtorch = self._use_ramtorch_linear and kwargs.get("direct_ramtorch", True)
+
+        if self.is_quant and not self._use_ramtorch_linear:
+            raise ValueError("Quantized Linear is not supported in Full algo.")
+        if self.bypass_mode:
+            raise ValueError("Bypass mode is not supported in Full algo.")
+
+        # Snapshot base weights/bias on CPU for diff computation
         self._org_weight = [self.org_module[0].weight.data.cpu().clone()]
         if self.org_module[0].bias is not None:
             self.org_bias = [self.org_module[0].bias.data.cpu().clone()]
         else:
             self.org_bias = None
 
-        if self._use_ramtorch_linear:
-            # Trainable diff params on CPU, pinned for fast H2D
-            self.diff = nn.Parameter(
-                torch.zeros_like(self._org_weight[0], device="cpu").pin_memory()
-            )
-            if self.org_bias is not None:
-                self.diff_b = nn.Parameter(
-                    torch.zeros_like(self.org_bias[0], device="cpu").pin_memory()
-                )
+        if self._use_ramtorch_linear and self.direct_ramtorch:
+            # Direct mode: train CPUBouncingLinear weights in-place.
+            # Register references so optimizer sees them as this module's params.
+            self.full_weight = self.org_module[0].weight   # shared Parameter
+            if self.org_module[0].bias is not None:
+                self.full_bias = self.org_module[0].bias
             else:
-                self.register_parameter("diff_b", None)
-
-            log_cpu_diff_creation()
-        else:
-            # Non-ramtorch path: standard GPU full finetune
-            self.diff = nn.Parameter(torch.zeros_like(org_module.weight))
+                self.register_parameter("full_bias", None)
+        elif self._use_ramtorch_linear:
+            # Existing diff-based ramtorch path (unchanged)
+            self.diff_weight = nn.Parameter(torch.zeros_like(org_module.weight, device="cpu").pin_memory())
+            self.diff_weight.is_ramtorch = True
             if org_module.bias is not None:
-                self.diff_b = nn.Parameter(torch.zeros_like(org_module.bias))
+                self.diff_bias = nn.Parameter(torch.zeros_like(org_module.bias, device="cpu").pin_memory())
+                self.diff_bias.is_ramtorch = True
             else:
-                self.register_parameter("diff_b", None)
+                self.register_parameter("diff_bias", None)
+        else:
+            # Non-ramtorch path: standard Full behavior
+            self.weight = nn.Parameter(torch.zeros_like(org_module.weight))
+            if org_module.bias is not None:
+                self.bias = nn.Parameter(torch.zeros_like(org_module.bias))
+            else:
+                self.register_parameter("bias", None)
 
-    @classmethod
-    def make_module_from_state_dict(cls, lora_name, orig_module, diff, diff_b):
-        module = cls(lora_name, orig_module, 1)
-        module.diff.data.copy_(diff)
-        if diff_b is not None and getattr(module, "diff_b", None) is not None:
-            module.diff_b.data.copy_(diff_b)
-        return module
+        self.is_diff = not (self._use_ramtorch_linear and self.direct_ramtorch)
+
+        @classmethod
+        def make_module_from_state_dict(cls, lora_name, orig_module, diff, diff_b):
+            module = cls(lora_name, orig_module, 1)
+
+            if module._use_ramtorch_linear and getattr(module, "direct_ramtorch", False):
+                # Direct mode: apply diff into CPUBouncingLinear weights
+                if diff is not None:
+                    new_w = orig_module.weight.data + diff.to(orig_module.weight.device)
+                    orig_module.weight.data.copy_(new_w)
+                if diff_b is not None and orig_module.bias is not None:
+                    new_b = orig_module.bias.data + diff_b.to(orig_module.bias.device)
+                    orig_module.bias.data.copy_(new_b)
+                module._org_weight[0] = orig_module.weight.data.cpu().clone()
+                if orig_module.bias is not None:
+                    module.org_bias = [orig_module.bias.data.cpu().clone()]
+                return module
+
+            if module._use_ramtorch_linear:
+                # RamTorch diff-weight path
+                module.diff_weight.data.copy_(diff)
+                if diff_b is not None and getattr(module, "diff_bias", None) is not None:
+                    module.diff_bias.data.copy_(diff_b)
+                return module
+
+            # Non-ramtorch path: original Full behavior
+            module.weight.copy_(diff)
+            if diff_b is not None:
+                if orig_module.bias is not None:
+                    module.bias.copy_(diff_b)
+                else:
+                    module.bias = nn.Parameter(diff_b)
+            module.is_diff = True
+            return module
 
     def apply_to(self, **kwargs):
         self.org_forward = self.org_module[0].forward
@@ -244,29 +283,108 @@ class FullModule(LycorisBaseModule):
         self.org_module[0].forward = self.org_forward
 
     def custom_state_dict(self):
-        return {
-            "diff": self.diff.data.cpu(),
-            "diff_b": self.diff_b.data.cpu() if self.diff_b is not None else None,
-        }
+        # Direct ramtorch mode: compute diff from in-place trained CPUBouncingLinear weights
+        if self._use_ramtorch_linear and self.direct_ramtorch:
+            base_w = self._org_weight[0]              # CPU snapshot
+            cur_w = self.org_module[0].weight.data.cpu()
+            diff = cur_w - base_w
+
+            diff_b = None
+            if self.org_bias is not None and self.org_module[0].bias is not None:
+                base_b = self.org_bias[0]
+                cur_b = self.org_module[0].bias.data.cpu()
+                diff_b = cur_b - base_b
+
+            sd = {"diff": diff}
+            if diff_b is not None:
+                sd["diff_b"] = diff_b
+            return sd
+
+        # RamTorch diff-weight path
+        if self._use_ramtorch_linear:
+            sd = {"diff": self.diff_weight.data.cpu()}
+            if self.diff_bias is not None:
+                sd["diff_b"] = self.diff_bias.data.cpu()
+            return sd
+
+        # Non-ramtorch path (original behavior)
+        diff = self.weight.data.cpu() - self._org_weight[0].cpu()
+        sd = {"diff": diff}
+        if self.bias is not None and self.org_bias is not None:
+            sd["diff_b"] = self.bias.data.cpu() - self.org_bias[0]
+        return sd
 
     def load_weight_prehook(self, state_dict, prefix, *args, **kwargs):
-        for key in ["diff", "diff_b"]:
-            full_key = f"{prefix}{key}"
-            if full_key in state_dict:
-                param = getattr(self, key)
-                if param is not None:
-                    param.data.copy_(state_dict.pop(full_key))
+        if self._use_ramtorch_linear and getattr(self, "direct_ramtorch", False):
+            diff_key = f"{prefix}diff"
+            diff_b_key = f"{prefix}diff_b"
+
+            if diff_key in state_dict:
+                diff = state_dict.pop(diff_key)
+                new_w = self._org_weight[0].to(diff.device) + diff
+                self.org_module[0].weight.data.copy_(new_w)
+
+            if diff_b_key in state_dict and self.org_bias is not None and self.org_module[0].bias is not None:
+                diff_b = state_dict.pop(diff_b_key)
+                new_b = self.org_bias[0].to(diff_b.device) + diff_b
+                self.org_module[0].bias.data.copy_(new_b)
+            return
+
+        # Existing behavior for non-direct ramtorch and non-ramtorch
+        if self._use_ramtorch_linear:
+            diff = state_dict.pop(f"{prefix}diff")
+            self.diff_weight.data.copy_(diff)
+            diff_b_key = f"{prefix}diff_b"
+            if diff_b_key in state_dict:
+                diff_b = state_dict.pop(diff_b_key)
+                if self.diff_bias is not None:
+                    self.diff_bias.data.copy_(diff_b)
+        else:
+            diff = state_dict.pop(f"{prefix}diff")
+            self.weight.data.copy_(self._org_weight[0].to(diff.device) + diff)
+            diff_b_key = f"{prefix}diff_b"
+            if diff_b_key in state_dict:
+                diff_b = state_dict.pop(diff_b_key)
+                if self.bias is not None:
+                    self.bias.data.copy_(self.org_bias[0].to(diff_b.device) + diff_b)
 
     def _apply(self, fn):
-        # Prevent diff params from moving off CPU when using ramtorch, but allow dtype changes
-        if getattr(self, "_use_ramtorch_linear", False):
-            probe = torch.empty(0, device="cpu", dtype=self.diff.dtype)
+        # 1) Ramtorch direct mode: protect CPUBouncingLinear params from device moves
+        if getattr(self, "_use_ramtorch_linear", False) and getattr(self, "direct_ramtorch", False):
+            # Underlying CPUBouncingLinear
+            linear = self.org_module[0]
+            w = linear.weight
+            b = linear.bias
+
+            # Mimic CPUBouncingLinear._apply: allow dtype change, keep device=cpu
+            dummy = torch.tensor(0.0, device="cpu", dtype=w.dtype)
+            result = fn(dummy)
+            target_dtype = result.dtype
+
+            if w.dtype != target_dtype:
+                w.data = w.data.to(dtype=target_dtype)
+            if b is not None and b.dtype != target_dtype:
+                b.data = b.data.to(dtype=target_dtype)
+
+            # Apply fn only to children/buffers, not to CPUBouncingLinear params
+            for m in self.children():
+                # org_module[0] will handle its own _apply if needed
+                if m is not linear:
+                    m._apply(fn)
+            for name, buf in self._buffers.items():
+                if buf is not None:
+                    self._buffers[name] = fn(buf)
+            return self
+
+        # 2) Ramtorch diff-based mode: keep existing CPU-pinned diff behavior
+        if getattr(self, "_use_ramtorch_linear", False) and not getattr(self, "direct_ramtorch", False):
+            probe = torch.empty(0, device="cpu", dtype=self.diff_weight.dtype)
             target_dtype = fn(probe).dtype
 
-            if self.diff is not None and self.diff.dtype != target_dtype:
-                self.diff.data = self.diff.data.to(dtype=target_dtype)
-            if self.diff_b is not None and self.diff_b.dtype != target_dtype:
-                self.diff_b.data = self.diff_b.data.to(dtype=target_dtype)
+            if self.diff_weight is not None and self.diff_weight.dtype != target_dtype:
+                self.diff_weight.data = self.diff_weight.data.to(dtype=target_dtype)
+            if getattr(self, "diff_bias", None) is not None and self.diff_bias.dtype != target_dtype:
+                self.diff_bias.data = self.diff_bias.data.to(dtype=target_dtype)
 
             for m in self.children():
                 m._apply(fn)
@@ -275,26 +393,62 @@ class FullModule(LycorisBaseModule):
                     self._buffers[name] = fn(buf)
             return self
 
+        # 3) Non-ramtorch path: default behavior
         return super()._apply(fn)
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.module_dropout and self.training and torch.rand(1) < self.module_dropout:
             return self.org_forward(x, *args, **kwargs)
 
+        if self._use_ramtorch_linear and self.direct_ramtorch:
+            # Direct mode: pure CPUBouncingLinear forward, no custom autograd.
+            return self.org_forward(x, *args, **kwargs)
+
         if self._use_ramtorch_linear:
-            # org and diff both on CPU; stream via ramtorch and do single GEMM
-            return _CPUStreamedDiffBouncingFn.apply(
+            # Existing diff-based ramtorch path
+            return _BouncingLinearDiffMixFn.apply(
                 x,
-                self.diff,
-                self.diff_b,
                 self._org_weight[0],
                 self.org_bias[0] if self.org_bias is not None else None,
+                self.diff_weight,
+                self.diff_bias,
                 self.multiplier,
+                torch.cuda.current_device(),
             )
         else:
-            # Non-ramtorch path: merge on GPU and use standard op
-            merged_weight = self.org_module[0].weight + self.multiplier * self.diff
-            merged_bias = self.org_module[0].bias
-            if merged_bias is not None and self.diff_b is not None:
-                merged_bias = merged_bias + self.multiplier * self.diff_b
-            return self.op(x, weight=merged_weight, bias=merged_bias, **self.kw_dict)
+            weight, bias = self.get_merged_weight(self.multiplier, device=x.device)
+            kw_dict = self.kw_dict | {"weight": weight, "bias": bias}
+            return self.op(x, **kw_dict)
+
+    def get_merged_weight(self, multiplier=1.0, shape=None, device=None):
+        # This is the original Full implementation from upstream LyCORIS.
+        # Used only in the non-ramtorch path (conv/linear on GPU).
+        if self.is_diff:
+            # weight/bias store only the diff; org is in _org_weight/org_bias.
+            diff_w = self.weight * multiplier
+            diff_b = self.bias * multiplier if self.bias is not None else None
+
+            org_w = self._org_weight[0].to(device, dtype=diff_w.dtype)
+            weight = org_w + diff_w
+
+            bias = None
+            if self.org_bias is not None:
+                org_b = self.org_bias[0].to(device)
+                if diff_b is not None:
+                    bias = org_b + diff_b
+                else:
+                    bias = org_b
+            return weight, bias
+        else:
+            # weight/bias already contain merged weights; scale only the diff part.
+            org_w = self._org_weight[0].to(self.weight.device, dtype=self.weight.dtype)
+            diff = self.weight - org_w
+            weight = org_w + diff * multiplier
+
+            bias = None
+            if self.bias is not None and self.org_bias is not None:
+                org_b = self.org_bias[0].to(self.bias.device, dtype=self.bias.dtype)
+                diff_b = self.bias - org_b
+                bias = org_b + diff_b * multiplier
+
+            return weight, bias
